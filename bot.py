@@ -10,7 +10,7 @@ from typing import Optional
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.DEBUG  # Changed to DEBUG for more info
 )
 logger = logging.getLogger(__name__)
 
@@ -18,27 +18,33 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BASE_API_URL = "https://andul-1.onrender.com/add_payment_method"
 
-# Fixed email (from your URL) - you might want to make this configurable
+# Fixed credentials (from your URL)
 EMAIL = "sogaged371@hudisk.com"
-PASSWORD = "sogaged371@"  # From your URL
+PASSWORD = "sogaged371@"
+
+def debug_print(message: str):
+    """Print debug messages."""
+    print(f"[DEBUG] {message}")
+    logger.debug(message)
 
 def extract_card_details(text: str) -> Optional[dict]:
     """Extract card details from various formats."""
-    # Pattern for full card format: number|MM|YY|CVV
-    full_card_pattern = r'(\d{13,19})\|(\d{2})\|(\d{2,4})\|(\d{3,4})'
+    debug_print(f"Extracting from text: {text}")
     
-    # Pattern for just BIN/number
-    bin_pattern = r'(?:/bin|\.bin|\b)(\d{6,})'
+    # Remove command if present
+    text = re.sub(r'^/bin\s+|^\.bin\s+', '', text).strip()
     
-    # Try full card format first
-    full_match = re.search(full_card_pattern, text)
-    if full_match:
-        number = full_match.group(1)
-        month = full_match.group(2)
-        year = full_match.group(3)
-        cvv = full_match.group(4)
+    # Pattern 1: Full card format - number|MM|YY|CVV
+    pattern1 = r'^(\d{13,19})\|(\d{2})\|(\d{2,4})\|(\d{3,4})$'
+    match1 = re.match(pattern1, text)
+    if match1:
+        debug_print(f"Matched full card pattern: {match1.groups()}")
+        number = match1.group(1)
+        month = match1.group(2)
+        year = match1.group(3)
+        cvv = match1.group(4)
         
-        # Handle 2-digit year (convert to 4-digit)
+        # Handle year format
         if len(year) == 2:
             year = "20" + year
         
@@ -50,150 +56,127 @@ def extract_card_details(text: str) -> Optional[dict]:
             "type": "full"
         }
     
-    # Try BIN/number only
-    bin_match = re.search(bin_pattern, text)
-    if bin_match:
-        number = bin_match.group(1)
+    # Pattern 2: Just numbers (BIN)
+    pattern2 = r'^(\d{6,})$'
+    match2 = re.match(pattern2, text)
+    if match2:
+        debug_print(f"Matched BIN pattern: {match2.group(1)}")
         return {
-            "number": number,
+            "number": match2.group(1),
             "type": "bin"
         }
     
+    debug_print("No pattern matched")
     return None
 
 def call_payment_api(card_details: dict) -> dict:
     """Call your payment method API."""
     try:
-        # Build the URL based on card type
-        if card_details["type"] == "full":
-            # Format: number|MM|YY|CVV (YY is last 2 digits based on your example)
-            card_string = f"{card_details['number']}|{card_details['month']}|{card_details['year'][-2:]}|{card_details['cvv']}"
-            
-            # URL encode the card string
-            encoded_card = urllib.parse.quote(card_string, safe='')
-            
-            # Build the full URL
-            api_url = f"{BASE_API_URL}/{EMAIL}/{PASSWORD}/{encoded_card}"
-            
-            logger.info(f"Calling API: {api_url}")
-            
-            # Make the request
-            response = requests.get(api_url, timeout=15)
-            
-        else:  # bin only
-            # For BIN only, we need to create a dummy card
+        # For BIN only, create a complete card number
+        if card_details["type"] == "bin":
             bin_number = card_details["number"]
             
-            # Create a dummy full card number (pad with zeros if needed)
-            dummy_card = bin_number.ljust(16, '0')[:16]  # Make it 16 digits
+            # Create a valid test card number
+            # If BIN is less than 16 digits, pad with test digits
+            if len(bin_number) < 16:
+                # Pad with valid test digits (making sure the Luhn check might pass)
+                # Common test pattern: BIN + 000000 + check digit
+                padded = bin_number.ljust(15, '0')  # Pad to 15 digits
+                # Simple Luhn check digit calculation
+                digits = [int(d) for d in padded]
+                for i in range(len(digits)-1, -1, -2):
+                    digits[i] = digits[i] * 2
+                    if digits[i] > 9:
+                        digits[i] -= 9
+                total = sum(digits)
+                check_digit = (10 - (total % 10)) % 10
+                card_number = padded + str(check_digit)
+            else:
+                card_number = bin_number
             
-            # Use current month/year for dummy expiration
-            from datetime import datetime
-            now = datetime.now()
-            month = now.strftime("%m")
-            year = str(now.year + 1)[-2:]  # Next year, 2-digit format
-            cvv = "123"  # Dummy CVV
+            # Use a valid future expiration
+            month = "12"
+            year = "2029"  # Far future
+            cvv = "123"
             
-            card_string = f"{dummy_card}|{month}|{year}|{cvv}"
-            encoded_card = urllib.parse.quote(card_string, safe='')
-            
-            api_url = f"{BASE_API_URL}/{EMAIL}/{PASSWORD}/{encoded_card}"
-            
-            logger.info(f"Calling API with dummy card for BIN: {api_url}")
-            response = requests.get(api_url, timeout=15)
+        else:  # Full card
+            card_number = card_details["number"]
+            month = card_details["month"]
+            year = card_details["year"]
+            cvv = card_details["cvv"]
         
-        # Log response for debugging
-        logger.info(f"API Response Status: {response.status_code}")
-        logger.info(f"API Response Text: {response.text[:500]}")  # First 500 chars
+        # Format year as 2 digits for API (based on your example)
+        year_2digit = year[-2:]
         
-        if response.status_code == 200:
+        # Create card string exactly as your API expects
+        card_string = f"{card_number}|{month}|{year_2digit}|{cvv}"
+        
+        # Debug: Show what we're sending
+        debug_print(f"Card string: {card_string}")
+        debug_print(f"Card length: {len(card_number)}")
+        
+        # Don't URL encode - your example shows it's not encoded
+        # Let's try both encoded and non-encoded to see what works
+        test_strings = [
+            card_string,  # Not encoded
+            urllib.parse.quote(card_string, safe='')  # Encoded
+        ]
+        
+        for i, card_str in enumerate(test_strings):
+            api_url = f"{BASE_API_URL}/{EMAIL}/{PASSWORD}/{card_str}"
+            debug_print(f"\n{'='*50}")
+            debug_print(f"API Attempt {i+1}:")
+            debug_print(f"URL: {api_url}")
+            debug_print(f"Card String Type: {'Encoded' if i == 1 else 'Not Encoded'}")
+            
             try:
-                return response.json()
-            except:
-                # If not JSON, return text
-                return {"raw_response": response.text, "status": "success"}
-        else:
-            return {
-                "error": f"API returned status {response.status_code}",
-                "details": response.text[:200] if response.text else "No response body"
-            }
+                response = requests.get(api_url, timeout=10)
+                debug_print(f"Status Code: {response.status_code}")
+                debug_print(f"Response Headers: {dict(response.headers)}")
+                debug_print(f"Response Text (first 500 chars): {response.text[:500]}")
+                
+                # Check if this attempt was successful
+                if response.status_code == 200:
+                    try:
+                        result = response.json()
+                        debug_print(f"JSON Response: {result}")
+                    except:
+                        result = {"raw_response": response.text}
+                    
+                    # Add which method worked
+                    result["_debug_method"] = "encoded" if i == 1 else "not_encoded"
+                    return result
+                
+            except Exception as e:
+                debug_print(f"Attempt {i+1} failed: {str(e)}")
+                continue
+        
+        # If neither worked
+        return {
+            "error": f"All attempts failed",
+            "status_code": response.status_code if 'response' in locals() else "No response",
+            "response_preview": response.text[:200] if 'response' in locals() else "No response"
+        }
             
     except requests.exceptions.Timeout:
-        return {"error": "API request timed out"}
+        debug_print("Request timed out")
+        return {"error": "API request timed out (10s)"}
     except requests.exceptions.RequestException as e:
+        debug_print(f"Request exception: {str(e)}")
         return {"error": f"Network error: {str(e)}"}
     except Exception as e:
+        debug_print(f"Unexpected error: {str(e)}")
         return {"error": f"Unexpected error: {str(e)}"}
-
-def format_response(api_response: dict, card_details: dict) -> str:
-    """Format API response into readable message."""
-    # Check for errors first
-    if "error" in api_response:
-        error_msg = f"❌ *API Error:* {api_response['error']}"
-        if "details" in api_response:
-            error_msg += f"\n📝 *Details:* {api_response['details']}"
-        return error_msg
-    
-    # Success response formatting
-    message = "✅ *BIN/Card Check Results*\n"
-    message += "─" * 40 + "\n"
-    
-    # Card info
-    if card_details["type"] == "full":
-        message += f"*Card Number:* `{card_details['number']}`\n"
-        message += f"*Expiry:* {card_details['month']}/{card_details['year']}\n"
-        message += f"*Type:* Full Card Check\n"
-    else:
-        message += f"*BIN Number:* `{card_details['number'][:8]}`\n"
-        message += f"*Type:* BIN Check\n"
-    
-    message += "─" * 40 + "\n"
-    
-    # API Response
-    message += "*API Response:*\n"
-    
-    if "raw_response" in api_response:
-        # Handle raw text response
-        raw_text = api_response['raw_response']
-        
-        # Try to parse common patterns
-        if "success" in raw_text.lower():
-            message += "✅ *Status:* Success\n"
-        elif "fail" in raw_text.lower() or "error" in raw_text.lower():
-            message += "❌ *Status:* Failed\n"
-        elif "invalid" in raw_text.lower():
-            message += "⚠️ *Status:* Invalid\n"
-        
-        # Show first 200 chars of response
-        preview = raw_text[:200] + ("..." if len(raw_text) > 200 else "")
-        message += f"📋 *Details:* {preview}\n"
-        
-    elif isinstance(api_response, dict):
-        # Format JSON response
-        for key, value in api_response.items():
-            if key not in ["status", "raw_response"] and value:
-                # Format key nicely
-                formatted_key = key.replace("_", " ").title()
-                message += f"• *{formatted_key}:* {value}\n"
-    
-    # Add footer
-    message += "─" * 40
-    message += f"\n🔗 *API Used:* {BASE_API_URL.split('/')[2]}"
-    
-    return message
 
 async def bin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /bin command."""
     if not context.args:
         await update.message.reply_text(
-            "📋 *BIN/Card Checker Bot*\n\n"
-            "*Usage Examples:*\n"
+            "📋 *BIN Checker*\n\n"
+            "*Usage:*\n"
             "• `/bin 428476` - Check BIN\n"
-            "• `/bin 5220940191435288|04|29|736` - Full card check\n"
-            "• `.bin 428476` - Alternative format\n"
-            "• Just send: `428476|04|29|736`\n\n"
-            "*Note:* For BIN checks, I'll use dummy expiry/CVV\n"
-            "*Privacy:* Only first 6-8 digits are used for checking!",
+            "• `/bin 428476|04|29|736` - Check full card\n"
+            "\n*Note:* This uses your API endpoint directly.",
             parse_mode='Markdown'
         )
         return
@@ -201,152 +184,155 @@ async def bin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = " ".join(context.args)
     await process_check_request(update, user_input)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle messages containing BINs/cards."""
-    user_input = update.message.text.strip()
-    
-    # Check if message contains card/BIN patterns
-    if re.search(r'(?:\d{13,19}\|\d{2}\|\d{2,4}\|\d{3,4})|(?:(?:/bin|\.bin|\b)\d{6,})', user_input):
-        await process_check_request(update, user_input)
-
 async def process_check_request(update: Update, user_input: str):
-    """Process card/BIN check request."""
-    # Extract card details
+    """Process check request."""
     card_details = extract_card_details(user_input)
     
     if not card_details:
         await update.message.reply_text(
-            "❌ *Invalid Format!*\n\n"
-            "*Valid formats:*\n"
-            "1. `/bin 123456` - 6+ digit BIN\n"
-            "2. `/bin 1234567812345678|MM|YY|CVV` - Full card\n"
-            "3. `.bin 123456` - Alternative command\n"
-            "4. `1234567812345678|04|29|736` - Direct card\n"
-            "5. `123456` - Just BIN number\n\n"
-            "*Example:* `/bin 4283322115809145|04|29|736`",
+            "❌ *Invalid Format*\n\n"
+            "Please use:\n"
+            "• `/bin 123456` (BIN only)\n"
+            "• `/bin 1234567890123456|MM|YY|CVV`\n\n"
+            "Example: `/bin 428476`",
             parse_mode='Markdown'
         )
         return
     
-    # Send processing message
+    # Show what we're checking
     if card_details["type"] == "full":
-        processing_text = f"🔍 Checking card `{card_details['number'][:6]}...{card_details['number'][-4:]}`..."
+        status_msg = f"🔍 *Checking Card:* `{card_details['number'][:6]}...{card_details['number'][-4:]}`"
     else:
-        processing_text = f"🔍 Checking BIN `{card_details['number'][:8]}`..."
+        status_msg = f"🔍 *Checking BIN:* `{card_details['number'][:8]}`"
     
-    processing_msg = await update.message.reply_text(processing_text)
+    status_msg += f"\n📧 *Account:* {EMAIL}"
+    
+    processing_msg = await update.message.reply_text(status_msg, parse_mode='Markdown')
     
     try:
         # Call API
         api_response = call_payment_api(card_details)
         
-        # Format and send response
-        response_text = format_response(api_response, card_details)
+        debug_print(f"Final API Response: {api_response}")
+        
+        # Format response
+        response_text = "📊 *API Response*\n"
+        response_text += "─" * 30 + "\n"
+        
+        if "error" in api_response:
+            response_text += f"❌ *Error:* {api_response['error']}\n"
+            if "status_code" in api_response:
+                response_text += f"📡 *Status Code:* {api_response['status_code']}\n"
+            if "response_preview" in api_response:
+                response_text += f"📝 *Response:* {api_response['response_preview']}\n"
+        elif "raw_response" in api_response:
+            response_text += f"📋 *Raw Response:*\n```\n{api_response['raw_response'][:500]}\n```\n"
+        else:
+            response_text += "✅ *Success!*\n"
+            for key, value in api_response.items():
+                if not key.startswith('_'):
+                    response_text += f"• *{key}:* {value}\n"
+        
+        # Add debug info
+        response_text += "─" * 30 + "\n"
+        response_text += f"🔗 *Endpoint:* {BASE_API_URL}\n"
+        if "_debug_method" in api_response:
+            response_text += f"⚙️ *Method:* {api_response['_debug_method']}"
+        
         await processing_msg.edit_text(response_text, parse_mode='Markdown')
         
     except Exception as e:
         logger.error(f"Error: {e}")
         await processing_msg.edit_text(
-            f"❌ *Processing Error*\n\n"
-            f"*Error:* {str(e)}\n\n"
-            f"Please try again or check the format.",
+            f"❌ *Bot Error*\n\n"
+            f"```\n{str(e)}\n```\n\n"
+            f"Please check the console/logs for details.",
             parse_mode='Markdown'
         )
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
-    welcome_text = """
-🤖 *BIN & Card Checker Bot*
-
-*Quick Start:*
-Send me a BIN or card in any format:
-
-*Formats Accepted:*
-• `/bin 428476` - BIN check
-• `/bin 5220940191435288|04|29|736` - Full card
-• `.bin 123456` - Alternative
-• `428476|04|29|736` - Direct card
-• `123456` - Just BIN
-
-*Examples:*
-• `/bin 428476`
-• `/bin 4283322115809145|04|29|736`
-• Just send: `4111111111111111|12|25|123`
-
-*Privacy:* I only use necessary digits for checking!
-    """
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command."""
-    help_text = """
-📚 *Help Guide*
-
-*Available Commands:*
-• `/start` - Welcome message
-• `/bin <number>` - Check BIN or card
-• `/help` - This help message
-
-*Card Format:*
-`CARD_NUMBER|MM|YY|CVV`
-Example: `4283322115809145|04|29|736`
-
-*BIN Format:*
-6-8 digit number
-Example: `428476` or `/bin 428476`
-
-*What happens with BIN only?*
-For BIN checks, I'll:
-1. Pad to 16 digits with zeros
-2. Use dummy expiry (next year)
-3. Use dummy CVV (123)
-4. Check against API
-
-*Security Note:*
-• No card data stored
-• Only API communication
-• Use at your own risk
-    """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
-async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test command to check API connection."""
-    test_msg = await update.message.reply_text("🔄 Testing API connection...")
+async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test the API directly."""
+    debug_print("\n" + "="*50)
+    debug_print("Starting API test...")
     
-    # Test with a dummy BIN
-    test_details = {"number": "428476", "type": "bin"}
+    # Test with your exact example from the URL
+    test_card = "4283322115809145|04|29|736"
+    api_url = f"{BASE_API_URL}/{EMAIL}/{PASSWORD}/{test_card}"
+    
+    debug_print(f"Test URL: {api_url}")
     
     try:
-        response = call_payment_api(test_details)
+        response = requests.get(api_url, timeout=10)
+        debug_print(f"Test Status: {response.status_code}")
+        debug_print(f"Test Response: {response.text[:500]}")
         
-        if "error" not in response:
-            await test_msg.edit_text(
-                "✅ *API Connection Successful!*\n\n"
-                f"*Status:* Connected\n"
-                f"*URL:* {BASE_API_URL}\n"
-                f"*Email:* {EMAIL}\n\n"
-                "Bot is ready to use! Try `/bin 428476`",
-                parse_mode='Markdown'
-            )
-        else:
-            await test_msg.edit_text(
-                f"❌ *API Connection Failed*\n\n"
-                f"*Error:* {response.get('error', 'Unknown')}\n"
-                f"*Details:* {response.get('details', 'None')}",
-                parse_mode='Markdown'
-            )
+        await update.message.reply_text(
+            f"🧪 *API Test Results*\n\n"
+            f"*URL:* `{api_url}`\n"
+            f"*Status:* {response.status_code}\n"
+            f"*Response:*\n```\n{response.text[:300]}\n```",
+            parse_mode='Markdown'
+        )
     except Exception as e:
-        await test_msg.edit_text(f"❌ Exception: {str(e)}")
+        await update.message.reply_text(f"❌ Test failed: {str(e)}")
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command."""
+    await update.message.reply_text(
+        "🤖 *BIN Checker Bot*\n\n"
+        "*Commands:*\n"
+        "• `/bin <number>` - Check BIN or card\n"
+        "• `/test` - Test API connection\n"
+        "• `/debug` - Show debug info\n\n"
+        "*Examples:*\n"
+        "`/bin 428476`\n"
+        "`/bin 4283322115809145|04|29|736`\n\n"
+        "*Current API:*\n"
+        f"`{BASE_API_URL}`",
+        parse_mode='Markdown'
+    )
+
+async def debug_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show debug information."""
+    info = f"""
+🔧 *Debug Information*
+
+*API Configuration:*
+• URL: `{BASE_API_URL}`
+• Email: `{EMAIL}`
+• Password: `{PASSWORD}`
+
+*Bot Status:*
+• Token Set: {'✅ Yes' if TELEGRAM_BOT_TOKEN != "YOUR_BOT_TOKEN_HERE" else '❌ No'}
+• Log Level: DEBUG
+
+*Test Commands:*
+• `/test` - Test API directly
+• `/bin 428476` - Test BIN
+• `/bin 4111111111111111|12|25|123` - Test card
+
+*Note:* Check console for detailed logs
+    """
+    await update.message.reply_text(info, parse_mode='Markdown')
 
 def main():
     """Start the bot."""
-    # Check required environment variables
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        logger.error("Please set TELEGRAM_BOT_TOKEN environment variable!")
-        print("\n❌ ERROR: Please set TELEGRAM_BOT_TOKEN")
+    print("\n" + "="*50)
+    print("🤖 BIN Checker Bot - Debug Mode")
+    print("="*50)
+    print(f"API URL: {BASE_API_URL}")
+    print(f"Email: {EMAIL}")
+    print(f"Password: {PASSWORD}")
+    print(f"Token Set: {'YES' if TELEGRAM_BOT_TOKEN != 'YOUR_BOT_TOKEN_HERE' else 'NO (Please set TELEGRAM_BOT_TOKEN)'}")
+    print("\nLogs will show detailed debug information")
+    print("Use /test command to check API directly")
+    print("="*50 + "\n")
+    
+    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ ERROR: Please set TELEGRAM_BOT_TOKEN")
         print("1. Get token from @BotFather")
-        print("2. Create .env file or set environment variable")
-        print("3. Run: export TELEGRAM_BOT_TOKEN='your_token_here'")
+        print("2. Run: export TELEGRAM_BOT_TOKEN='your_token_here'")
+        print("3. Or create .env file with TELEGRAM_BOT_TOKEN=your_token")
         return
     
     # Create application
@@ -354,20 +340,16 @@ def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("bin", bin_command))
-    application.add_handler(CommandHandler("test", test_command))  # Optional test command
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("test", test_api))
+    application.add_handler(CommandHandler("debug", debug_info))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bin_command))
     
     # Start bot
-    logger.info("Starting bot...")
-    logger.info(f"Using API: {BASE_API_URL}")
-    logger.info(f"Using email: {EMAIL}")
-    print(f"\n🤖 Bot is starting...")
-    print(f"🔗 API URL: {BASE_API_URL}")
-    print(f"📧 Email: {EMAIL}")
-    print(f"🔑 Password: {'*' * len(PASSWORD)}")
-    print(f"✅ Ready to receive BIN/card checks!")
+    print("✅ Bot is starting...")
+    print("📝 Send /test to check API connection")
+    print("📝 Send /bin 428476 to test BIN check")
+    print("="*50 + "\n")
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
