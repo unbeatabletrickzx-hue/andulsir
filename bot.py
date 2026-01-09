@@ -3,14 +3,12 @@ import re
 import asyncio
 import aiohttp
 import tempfile
-import signal
-import sys
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
 import logging
 
-# Enhanced logging for production
+# Enable logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -26,14 +24,6 @@ WAITING_FOR_FILE = 2
 
 # Global session
 session = None
-
-# Restart signal handler
-def signal_handler(signum, frame):
-    logger.info(f"Received signal {signum}, shutting down gracefully...")
-    sys.exit(0)
-
-signal.signal(signal.SIGTERM, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
 
 async def init_session():
     """Initialize aiohttp session"""
@@ -411,10 +401,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /file - Upload .txt file with cards
 
 *Card Format:*CARD_NUMBER|MM|YYYY|CVV
-    *Examples:*/chk 5220940191435288|06|2027|404
+*Examples:*/chk 5220940191435288|06|2027|404
 /mass
 4232231106894283|06|26|241
-    
+
 *File Upload:*
 1. Create a .txt file with cards (one per line)
 2. Use /file command
@@ -430,7 +420,7 @@ async def handle_direct_card(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = update.message.text.strip()
     
     # Check if it looks like a card
-    if '|' in text and text.count('|') == 3 and any(c.isdigit() for char in text):
+    if '|' in text and text.count('|') == 3 and any(c.isdigit() for c in text):
         message = await update.message.reply_text("🔍 *Checking card...*", parse_mode=ParseMode.MARKDOWN)
         result = await check_card(text)
         
@@ -451,16 +441,17 @@ async def post_stop(application):
     """Cleanup on stop"""
     await close_session()
 
-async def main():
-    """Start the bot with restart capability"""
+def main():
+    """Start the bot"""
     TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     if not TOKEN:
-        logger.error("❌ TELEGRAM_BOT_TOKEN environment variable not set!")
-        sys.exit(1)
+        print("❌ Error: TELEGRAM_BOT_TOKEN not set")
+        print("Set it with: export TELEGRAM_BOT_TOKEN='your_token_here'")
+        return
     
-    logger.info("🤖 Starting CC Checker Bot...")
+    print("🤖 Starting CC Checker Bot...")
     
-    # Create application with persistence for restarts
+    # Create application
     application = Application.builder().token(TOKEN).post_stop(post_stop).build()
     
     # Create conversation handler for mass check
@@ -498,26 +489,16 @@ async def main():
     # Error handler
     application.add_error_handler(error_handler)
     
-    logger.info("✅ Bot is ready!")
-    logger.info("📱 Use /start to see commands")
+    print("✅ Bot is ready!")
+    print("📱 Use /start to see commands")
     
-    # Run with restart handling
-    try:
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
-        
-        # Keep running
-        await asyncio.Event().wait()
-        
-    except KeyboardInterrupt:
-        logger.info("🛑 Bot stopped by user")
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
-    finally:
-        await application.stop()
-        await close_session()
+    # Run
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
-    # Run with asyncio for better async support
-    asyncio.run(main())
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped")
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
