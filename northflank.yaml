@@ -1,0 +1,21 @@
+version: "1"
+services:
+  cc-checker-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    resources:
+      memory: 512M
+      cpu: 0.5
+    scaling:
+      replicas: 1
+    health:
+      type: command
+      command: ["pgrep", "-f", "python bot.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    environment:
+      - name: TELEGRAM_BOT_TOKEN
+        required: true
+        value: ${TELEGRAM_BOT_TOKEN}
