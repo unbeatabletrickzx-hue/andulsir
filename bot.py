@@ -215,14 +215,13 @@ async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /chk command"""
     if not context.args:
         await update.message.reply_text(
-            "❌ *Usage:* `/chk CARD|MM|YYYY|CVV`\n\n"
-            "*Example:* `/chk 5220940191435288|06|2027|404`",
+            "❌ Usage: /chk CARD|MM|YYYY|CVV\n\nExample: /chk 5220940191435288|06|2027|404",
             parse_mode=ParseMode.MARKDOWN
         )
         return
     
     card_input = ' '.join(context.args)
-    message = await update.message.reply_text("🔍 *Checking card...*", parse_mode=ParseMode.MARKDOWN)
+    message = await update.message.reply_text("🔍 Checking card...", parse_mode=ParseMode.MARKDOWN)
     
     _, result = await check_card(card_input)
     await message.edit_text(result)
@@ -230,14 +229,7 @@ async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def mass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /mass command"""
     await update.message.reply_text(
-        "📋 *MASS CHECK*\n\n"
-        "Send up to 30 cards (one per line):\n"
-        "```\n"
-        "4232231106894283|06|26|241\n"
-        "4116670005727071|02|26|426\n"
-        "5303471055207621|01|27|456\n"
-        "```\n"
-        "Type /cancel to stop.",
+        "📋 MASS CHECK\n\nSend up to 30 cards (one per line):\n\n4232231106894283|06|26|241\n4116670005727071|02|26|426\n5303471055207621|01|27|456\n\nType /cancel to stop.",
         parse_mode=ParseMode.MARKDOWN
     )
     
@@ -246,10 +238,7 @@ async def mass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /file command"""
     await update.message.reply_text(
-        "📁 *FILE UPLOAD*\n\n"
-        "Send a .txt file containing cards (one per line).\n"
-        "Max 30 cards.\n\n"
-        "Type /cancel to stop.",
+        "📁 FILE UPLOAD\n\nSend a .txt file containing cards (one per line).\nMax 30 cards.\n\nType /cancel to stop.",
         parse_mode=ParseMode.MARKDOWN
     )
     
@@ -333,7 +322,7 @@ async def process_cards(update, cards, source_name):
     
     # Send initial status
     status_msg = await update.message.reply_text(
-        f"🔄 *{source_name}*\nProcessing {total_cards} cards...",
+        f"🔄 {source_name}\nProcessing {total_cards} cards...",
         parse_mode=ParseMode.MARKDOWN
     )
     
@@ -359,7 +348,7 @@ async def process_cards(update, cards, source_name):
             # Update status every 3 cards
             if i % 3 == 0 or i == total_cards:
                 await status_msg.edit_text(
-                    f"🔄 *{source_name}*\nProgress: {i}/{total_cards} cards",
+                    f"🔄 {source_name}\nProgress: {i}/{total_cards} cards",
                     parse_mode=ParseMode.MARKDOWN
                 )
             
@@ -374,10 +363,7 @@ async def process_cards(update, cards, source_name):
     
     # Final summary
     await status_msg.edit_text(
-        f"✅ *{source_name} Complete!*\n"
-        f"✅ Successful: {successful}\n"
-        f"❌ Failed: {failed}\n"
-        f"📋 Total: {total_cards}",
+        f"✅ {source_name} Complete!\n✅ Successful: {successful}\n❌ Failed: {failed}\n📋 Total: {total_cards}",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -388,22 +374,24 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed help"""
-    help_text = """📚 *CC CHECKER BOT HELP*
+    help_text = """📚 CC CHECKER BOT HELP
 
-*Commands:*
+Commands:
 /start - Show commands
 /help - Show this help
 /chk - Check single card
 /mass - Check multiple cards (1-30)
 /file - Upload .txt file with cards
 
-*Card Format:*
+Card Format:
 CARD_NUMBER|MM|YYYY|CVV
 
-*Examples:*/chk 5220940191435288|06|2027|404
+Examples:
+/chk 5220940191435288|06|2027|404
 /mass
 4232231106894283|06|26|241
-        
+4116670005727071|02|26|426"""
+    
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_direct_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -412,7 +400,7 @@ async def handle_direct_card(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     # Check if it looks like a card
     if '|' in text and text.count('|') == 3 and any(c.isdigit() for c in text):
-        message = await update.message.reply_text("🔍 *Checking card...*", parse_mode=ParseMode.MARKDOWN)
+        message = await update.message.reply_text("🔍 Checking card...", parse_mode=ParseMode.MARKDOWN)
         _, result = await check_card(text)
         await message.edit_text(result)
 
