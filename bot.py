@@ -30,7 +30,7 @@ async def init_session():
     global session
     if not session:
         timeout = aiohttp.ClientTimeout(total=30)
-        connector = aiohttp.TCPConnector(limit=1)  # Limit connections for free tier
+        connector = aiohttp.TCPConnector(limit=1)
         session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
 async def close_session():
@@ -198,18 +198,16 @@ def parse_response(card_info, response_text):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
-    welcome_text = """💳 *CC CHECKER BOT (Render Webhook)*
+    welcome_text = """💳 *CC CHECKER BOT*
 
 *Commands:*
 /chk - Check single card
-/mass - Check multiple cards (1-30)
-/file - Upload .txt file with cards
+/mass - Check multiple cards
+/file - Upload .txt file
 /help - Show detailed help
 
 *Format:* CARD|MM|YY|CVV
-*Example:* 5220940191435288|06|2027|404
-
-⚡ *Optimized for Render Free Tier*"""
+*Example:* 5220940191435288|06|27|404"""
     
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -230,33 +228,20 @@ async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.edit_text(result)
 
 async def mass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /mass command - optimized for free tier"""
-    if not context.args:
-        await update.message.reply_text(
-            "📋 *MASS CHECK (Optimized)*\n\n"
-            "Send cards with the command:\n"
-            "`/mass card1|mm|yy|cvv card2|mm|yy|cvv`\n\n"
-            "Or type /mass and then send cards one per line\n"
-            "Type /cancel to stop.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return WAITING_FOR_CARDS
+    """Handle /mass command"""
+    await update.message.reply_text(
+        "📋 *MASS CHECK*\n\n"
+        "Send up to 30 cards (one per line):\n"
+        "```\n"
+        "4232231106894283|06|26|241\n"
+        "4116670005727071|02|26|426\n"
+        "5303471055207621|01|27|456\n"
+        "```\n"
+        "Type /cancel to stop.",
+        parse_mode=ParseMode.MARKDOWN
+    )
     
-    # Cards provided inline
-    cards = []
-    for arg in context.args:
-        if '|' in arg:
-            cards.append(arg)
-    
-    if cards:
-        await process_cards_optimized(update, cards, "Mass Check")
-        return ConversationHandler.END
-    else:
-        await update.message.reply_text(
-            "📋 Please send cards (one per line):",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return WAITING_FOR_CARDS
+    return WAITING_FOR_CARDS
 
 async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /file command"""
@@ -286,7 +271,7 @@ async def receive_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No cards found.")
         return WAITING_FOR_CARDS
     
-    await process_cards_optimized(update, cards, "Mass Check")
+    await process_cards(update, cards, "Mass Check")
     return ConversationHandler.END
 
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -325,7 +310,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ No valid cards found in file.")
             return ConversationHandler.END
         
-        await process_cards_optimized(update, cards, "File Upload")
+        await process_cards(update, cards, "File Upload")
         
     except Exception as e:
         logger.error(f"File processing error: {e}")
@@ -333,8 +318,8 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return ConversationHandler.END
 
-async def process_cards_optimized(update, cards, source_name):
-    """Process cards optimized for free tier (sequential with status updates)"""
+async def process_cards(update, cards, source_name):
+    """Process list of cards"""
     # Limit to 30 cards
     if len(cards) > 30:
         await update.message.reply_text(f"⚠️ Limiting to first 30 cards (you sent {len(cards)})")
@@ -348,9 +333,7 @@ async def process_cards_optimized(update, cards, source_name):
     
     # Send initial status
     status_msg = await update.message.reply_text(
-        f"🔄 *{source_name}*\n"
-        f"Processing {total_cards} cards...\n"
-        f"⏱️ Estimated time: ~{total_cards * 3} seconds",
+        f"🔄 *{source_name}*\nProcessing {total_cards} cards...",
         parse_mode=ParseMode.MARKDOWN
     )
     
@@ -358,7 +341,7 @@ async def process_cards_optimized(update, cards, source_name):
     successful = 0
     failed = 0
     
-    # Process cards sequentially (free tier friendly)
+    # Process cards sequentially
     for i, card in enumerate(cards, 1):
         try:
             _, result = await check_card(card)
@@ -376,14 +359,11 @@ async def process_cards_optimized(update, cards, source_name):
             # Update status every 3 cards
             if i % 3 == 0 or i == total_cards:
                 await status_msg.edit_text(
-                    f"🔄 *{source_name}*\n"
-                    f"Progress: {i}/{total_cards} cards\n"
-                    f"✅ Successful: {successful}\n"
-                    f"❌ Failed: {failed}",
+                    f"🔄 *{source_name}*\nProgress: {i}/{total_cards} cards",
                     parse_mode=ParseMode.MARKDOWN
                 )
             
-            # Small delay to avoid rate limits (free tier)
+            # Small delay
             if i < total_cards:
                 await asyncio.sleep(0.5)
                 
@@ -395,10 +375,9 @@ async def process_cards_optimized(update, cards, source_name):
     # Final summary
     await status_msg.edit_text(
         f"✅ *{source_name} Complete!*\n"
-        f"📊 Results:\n"
-        f"  ✅ Successful: {successful}\n"
-        f"  ❌ Failed: {failed}\n"
-        f"  📋 Total: {total_cards}",
+        f"✅ Successful: {successful}\n"
+        f"❌ Failed: {failed}\n"
+        f"📋 Total: {total_cards}",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -409,7 +388,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed help"""
-    help_text = """📚 *CC CHECKER BOT HELP (Render Optimized)*
+    help_text = """📚 *CC CHECKER BOT HELP*
 
 *Commands:*
 /start - Show commands
@@ -418,18 +397,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /mass - Check multiple cards (1-30)
 /file - Upload .txt file with cards
 
-*Usage Examples:*/chk 5220940191435288|06|2027|404
-/mass 4232231106894283|06|26|241
-    
-*For Render Free Tier:*
-- Sequential processing (no parallel)
-- 30 cards in ~1.5 minutes
-- Optimized for 750 free hours/month
+*Card Format:*
+CARD_NUMBER|MM|YYYY|CVV
 
-*File Upload:*
-Create a .txt file with cards (one per line):
-CARD|MM|YY|CVV
-CARD|MM|YY|CVV
+*Examples:*/chk 5220940191435288|06|2027|404
+/mass
+4232231106894283|06|26|241
         
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -455,23 +428,15 @@ async def post_stop(application):
     """Cleanup on stop"""
     await close_session()
 
-# Webhook setup function
-async def set_webhook(application, webhook_url):
-    """Set webhook for Render"""
-    await application.bot.set_webhook(url=webhook_url)
-
 def main():
-    """Start the bot with webhook for Render"""
+    """Start the bot"""
     TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    PORT = int(os.getenv('PORT', 8080))  # Render provides PORT
-    WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')  # Set in Render environment
-    
     if not TOKEN:
         print("❌ Error: TELEGRAM_BOT_TOKEN not set")
+        print("Set it with: export TELEGRAM_BOT_TOKEN='your_token_here'")
         return
     
-    print("🤖 Starting CC Checker Bot for Render...")
-    print(f"📡 Port: {PORT}")
+    print("🤖 Starting CC Checker Bot...")
     
     # Create application
     application = Application.builder().token(TOKEN).post_stop(post_stop).build()
@@ -514,35 +479,8 @@ def main():
     print("✅ Bot is ready!")
     print("📱 Use /start to see commands")
     
-    # Check if running on Render (has PORT env var)
-    if PORT != 8080 or WEBHOOK_URL:
-        # Run with webhook for Render
-        print("🌐 Running in Webhook mode for Render...")
-        
-        import asyncio
-        from telegram.ext import Updater
-        
-        async def run_webhook():
-            await application.initialize()
-            
-            # Set webhook if URL provided
-            if WEBHOOK_URL:
-                await set_webhook(application, WEBHOOK_URL)
-                print(f"✅ Webhook set to: {WEBHOOK_URL}")
-            else:
-                # Start without webhook for local testing
-                await application.start()
-                await application.updater.start_polling(drop_pending_updates=True)
-                print("✅ Started polling (local mode)")
-                
-                # Keep running
-                await asyncio.Event().wait()
-        
-        asyncio.run(run_webhook())
-    else:
-        # Run with polling locally
-        print("🔄 Running in Polling mode (local)...")
-        application.run_polling(drop_pending_updates=True)
+    # Run
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     try:
