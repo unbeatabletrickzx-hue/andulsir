@@ -1,162 +1,147 @@
 import os
-import re
 import asyncio
-from contextlib import asynccontextmanager
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response
 
-# ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+API_BASE = os.getenv("API_BASE", "").rstrip("/")  # e.g. https://andulsir-1.onrender.com
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ================= CARD UTILS =================
-CARD_RE = re.compile(r"^\s*(\d{12,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})\s*$")
+app = FastAPI()
 
-
-def luhn_ok(card: str) -> bool:
-    total = 0
-    rev = card[::-1]
-    for i, ch in enumerate(rev):
-        d = int(ch)
-        if i % 2 == 1:
-            d *= 2
-            if d > 9:
-                d -= 9
-        total += d
-    return total % 10 == 0
-
-
-def mask(card: str) -> str:
-    return card[:6] + "*" * (len(card) - 10) + card[-4:]
-
-
-def normalize_year(y: str) -> int:
-    y = int(y)
-    return y + 2000 if y < 100 else y
-
-
-def check_card(card, mm, yy, cvv):
-    errors = []
-
-    if not luhn_ok(card):
-        errors.append("Luhn failed")
-
-    if not (1 <= int(mm) <= 12):
-        errors.append("Month invalid")
-
-    if not (2000 <= normalize_year(yy) <= 2100):
-        errors.append("Year invalid")
-
-    if len(cvv) not in (3, 4):
-        errors.append("CVV invalid")
-
-    return errors
-
-
-async def tg_send(chat_id, text, reply_to=None):
-    async with httpx.AsyncClient() as client:
-        payload = {"chat_id": chat_id, "text": text}
-        if reply_to:
-            payload["reply_to_message_id"] = reply_to
+# ---------- Telegram helpers ----------
+async def tg_send(chat_id: int, text: str, reply_to: Optional[int] = None):
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_to is not None:
+        payload["reply_to_message_id"] = reply_to
+    async with httpx.AsyncClient(timeout=20) as client:
         await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
+def extract(update: dict):
+    msg = update.get("message") or update.get("edited_message")
+    if not msg:
+        return None, None, ""
+    return msg["chat"]["id"], msg["message_id"], (msg.get("text") or "").strip()
 
-# ================= FASTAPI =================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    if BOT_TOKEN and PUBLIC_BASE_URL:
-        webhook = f"{PUBLIC_BASE_URL}/webhook"
-        async with httpx.AsyncClient() as client:
-            try:
-                await client.post(
-                    f"{TELEGRAM_API}/setWebhook",
-                    json={"url": webhook},
-                )
-            except Exception:
-                pass
-    yield
+# ---------- Format API response ----------
+def format_api_result(item: str, data: dict) -> str:
+    """
+    Adjust this to match your "image" format.
+    This assumes your API returns JSON like:
+      { "status": "approved/declined", "message": "...", "details": {...} }
+    """
+    status = str(data.get("status", "unknown")).upper()
+    message = data.get("message", "") or data.get("result", "") or "—"
+    code = data.get("code", "")  # optional
+    extra = data.get("details", {}) if isinstance(data.get("details"), dict) else {}
 
+    lines = [
+        f"Status: {status}",
+        f"Item: {item}",
+        f"Message: {message}",
+    ]
+    if code:
+        lines.append(f"Code: {code}")
 
-app = FastAPI(lifespan=lifespan)
+    # show a few safe extra fields if present
+    for k in ("brand", "last4", "exp_month", "exp_year", "country"):
+        if k in extra:
+            lines.append(f"{k}: {extra[k]}")
 
+    return "\n".join(lines)
+
+# ---------- Call your API ----------
+async def call_your_api(client: httpx.AsyncClient, item: str) -> dict:
+    """
+    Example endpoint: {API_BASE}/check/{item}
+    Change this path to match your actual API.
+    """
+    url = f"{API_BASE}/check/{item}"
+    r = await client.get(url)
+    r.raise_for_status()
+    return r.json()
+
+@app.on_event("startup")
+async def startup_set_webhook():
+    if not (BOT_TOKEN and PUBLIC_BASE_URL):
+        return
+    webhook_url = f"{PUBLIC_BASE_URL}/webhook"
+    async with httpx.AsyncClient(timeout=20) as client:
+        await client.post(f"{TELEGRAM_API}/setWebhook", json={"url": webhook_url})
 
 @app.get("/")
 async def root():
-    return {"status": "ok"}
-
+    return {"ok": True}
 
 @app.post("/webhook")
 async def webhook(req: Request):
-    data = await req.json()
-    msg = data.get("message")
-    if not msg:
+    update = await req.json()
+    chat_id, message_id, text = extract(update)
+    if not chat_id or not text:
         return Response(status_code=200)
-
-    chat_id = msg["chat"]["id"]
-    msg_id = msg["message_id"]
-    text = msg.get("text", "").strip()
 
     if text in ("/start", "/help"):
         await tg_send(
             chat_id,
             "Commands:\n"
-            "//chk card|mm|yyyy|cvv\n"
-            "/mass (new line) card|mm|yyyy|cvv (1–30 lines)",
-            msg_id,
+            "/chk <token_or_id>\n"
+            "/mass ثم ضع 1-30 سطر من tokens/ids\n\n"
+            "Example:\n"
+            "/chk pm_12345\n"
+            "/mass\npm_1\npm_2",
+            reply_to=message_id,
         )
         return Response(status_code=200)
 
-    if text.startswith("//chk") or text.startswith("/chk"):
+    # Single
+    if text.startswith("/chk"):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            await tg_send(chat_id, "Wrong format", msg_id)
+            await tg_send(chat_id, "Usage: /chk <token_or_id>", reply_to=message_id)
             return Response(status_code=200)
 
-        m = CARD_RE.match(parts[1])
-        if not m:
-            await tg_send(chat_id, "Invalid format", msg_id)
-            return Response(status_code=200)
-
-        card, mm, yy, cvv = m.groups()
-        errors = check_card(card, mm, yy, cvv)
-
-        status = "✅ VALID" if not errors else "❌ INVALID"
-        result = (
-            f"{status}\n"
-            f"Card: {mask(card)}\n"
-            f"Exp: {mm}/{normalize_year(yy)}\n"
-            f"Result: {' / '.join(errors) if errors else 'Format OK'}"
-        )
-
-        await tg_send(chat_id, result, msg_id)
+        item = parts[1].strip()
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                data = await call_your_api(client, item)
+                out = format_api_result(item, data)
+            except Exception as e:
+                out = f"Status: ERROR\nItem: {item}\nMessage: {type(e).__name__}"
+        await tg_send(chat_id, out, reply_to=message_id)
         return Response(status_code=200)
 
+    # Mass (parallel with limit)
     if text.startswith("/mass"):
-        lines = text.splitlines()[1:]
-        cards = []
-        for ln in lines:
-            m = CARD_RE.match(ln)
-            if m:
-                cards.append(m.groups())
-            if len(cards) >= 30:
-                break
+        lines = [ln.strip() for ln in text.splitlines()[1:] if ln.strip()]
+        items = lines[:30]
+        if not items:
+            await tg_send(chat_id, "Usage:\n/mass\nid1\nid2\n... (up to 30)", reply_to=message_id)
+            return Response(status_code=200)
 
-        await tg_send(chat_id, f"Checking {len(cards)} cards...")
+        await tg_send(chat_id, f"Processing {len(items)} items...", reply_to=message_id)
 
-        for card, mm, yy, cvv in cards:
-            errors = check_card(card, mm, yy, cvv)
-            status = "✅ VALID" if not errors else "❌ INVALID"
-            msg = (
-                f"{status}\n"
-                f"Card: {mask(card)}\n"
-                f"Exp: {mm}/{normalize_year(yy)}\n"
-                f"Result: {' / '.join(errors) if errors else 'Format OK'}"
-            )
+        sem = asyncio.Semaphore(8)  # concurrency limit (tune 4-10)
+
+        async def worker(client: httpx.AsyncClient, item: str):
+            async with sem:
+                try:
+                    data = await call_your_api(client, item)
+                    return item, format_api_result(item, data)
+                except Exception as e:
+                    return item, f"Status: ERROR\nItem: {item}\nMessage: {type(e).__name__}"
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            results = await asyncio.gather(*(worker(client, it) for it in items))
+
+        # Send one-by-one
+        for _, msg in results:
             await tg_send(chat_id, msg)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)
+
+        return Response(status_code=200)
 
     return Response(status_code=200)
