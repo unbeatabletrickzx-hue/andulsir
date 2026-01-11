@@ -1,25 +1,25 @@
 import os
 import re
 import asyncio
+from contextlib import asynccontextmanager
 from typing import List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Request, Response
 
+# ====== ENV VARS (set these in Render) ======
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # simple shared secret path segment
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # e.g. https://your-app.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-app = FastAPI()
+# ====== CARD PARSER ======
+CARD_LINE_RE = re.compile(r"^\s*(\d{12,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})\s*$")
 
-CARD_LINE_RE = re.compile(
-    r"^\s*(\d{12,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})\s*$"
-)
 
 def luhn_ok(pan: str) -> bool:
-    # Luhn checksum
+    """Return True if PAN passes Luhn checksum."""
     total = 0
     rev = pan[::-1]
     for i, ch in enumerate(rev):
@@ -31,11 +31,13 @@ def luhn_ok(pan: str) -> bool:
         total += d
     return total % 10 == 0
 
+
 def mask_pan(pan: str) -> str:
-    # show first 6 and last 4, mask the rest
+    """Show first 6 and last 4 digits; mask the rest."""
     if len(pan) < 10:
         return pan
     return f"{pan[:6]}{'*' * (len(pan) - 10)}{pan[-4:]}"
+
 
 def normalize_year(y: str) -> int:
     yi = int(y)
@@ -43,42 +45,45 @@ def normalize_year(y: str) -> int:
         yi += 2000
     return yi
 
+
 def validate_card_fields(pan: str, mm: str, yy: str, cvv: str) -> Tuple[bool, List[str]]:
+    """Validate basic format, expiry ranges, CVV length, and Luhn."""
     issues = []
 
-    # PAN basic length
     if not (12 <= len(pan) <= 19):
         issues.append("PAN length invalid")
 
-    # Month range
-    m = int(mm)
-    if not (1 <= m <= 12):
+    try:
+        m = int(mm)
+        if not (1 <= m <= 12):
+            issues.append("Expiry month invalid")
+    except ValueError:
         issues.append("Expiry month invalid")
 
-    # Year range (simple sanity)
-    y = normalize_year(yy)
-    if not (2000 <= y <= 2100):
+    try:
+        y = normalize_year(yy)
+        if not (2000 <= y <= 2100):
+            issues.append("Expiry year invalid")
+    except ValueError:
         issues.append("Expiry year invalid")
 
-    # CVV length
     if len(cvv) not in (3, 4):
         issues.append("CVV length invalid")
 
-    # Luhn
     if not luhn_ok(pan):
         issues.append("Luhn check failed")
 
     return (len(issues) == 0), issues
 
-def render_reply(pan: str, mm: str, yy: str, cvv: str, ok: bool, issues: List[str]) -> str:
-    # You can tweak this to match your “image” style.
+
+def render_reply(pan: str, mm: str, yy: str, ok: bool, issues: List[str]) -> str:
+    """Telegram reply text. CVV is NEVER echoed back."""
     masked = mask_pan(pan)
     year = normalize_year(yy)
-
-    status = "✅ VALID (format)" if ok else "❌ INVALID (format)"
+    status = "✅ VALID (format/Luhn)" if ok else "❌ INVALID (format/Luhn)"
     reason = " / ".join(issues) if issues else "Looks syntactically valid."
 
-    # NOTE: We do NOT print CVV back.
+    # Edit this text to match your preferred “image” style
     return (
         f"{status}\n"
         f"Card: {masked}\n"
@@ -86,7 +91,12 @@ def render_reply(pan: str, mm: str, yy: str, cvv: str, ok: bool, issues: List[st
         f"Result: {reason}"
     )
 
+
 async def tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = None):
+    """Send a message to Telegram."""
+    if not BOT_TOKEN:
+        return
+
     payload = {"chat_id": chat_id, "text": text}
     if reply_to is not None:
         payload["reply_to_message_id"] = reply_to
@@ -94,6 +104,7 @@ async def tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = Non
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
         r.raise_for_status()
+
 
 def extract_text(update: dict) -> Tuple[Optional[int], Optional[int], str]:
     msg = update.get("message") or update.get("edited_message")
@@ -104,11 +115,13 @@ def extract_text(update: dict) -> Tuple[Optional[int], Optional[int], str]:
     text = msg.get("text") or ""
     return chat_id, message_id, text
 
-def parse_single(text: str) -> Optional[Tuple[str, str, str, str]]:
-    m = CARD_LINE_RE.match(text)
+
+def parse_single(card_str: str) -> Optional[Tuple[str, str, str, str]]:
+    m = CARD_LINE_RE.match(card_str)
     if not m:
         return None
     return m.group(1), m.group(2), m.group(3), m.group(4)
+
 
 def parse_mass_lines(lines: List[str]) -> List[Tuple[str, str, str, str]]:
     out = []
@@ -120,12 +133,37 @@ def parse_mass_lines(lines: List[str]) -> List[Tuple[str, str, str, str]]:
             break
     return out
 
+
+# ====== LIFESPAN (startup) to set webhook ======
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: set webhook if env vars are set
+    if BOT_TOKEN and WEBHOOK_SECRET and PUBLIC_BASE_URL:
+        webhook_url = f"{PUBLIC_BASE_URL}/webhook/{WEBHOOK_SECRET}"
+        async with httpx.AsyncClient(timeout=20) as client:
+            try:
+                await client.post(f"{TELEGRAM_API}/setWebhook", json={"url": webhook_url})
+            except Exception:
+                # Don't crash the app if Telegram is unreachable
+                pass
+    yield
+    # Shutdown: nothing
+
+
+app = FastAPI(lifespan=lifespan)
+
+
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "telegram-format-checker"}
+    return {"ok": True, "service": "telegram-format-luhn-bot"}
 
-@app.post(f"/webhook/{WEBHOOK_SECRET}")
-async def telegram_webhook(req: Request):
+
+@app.post("/webhook/{secret}")
+async def telegram_webhook(secret: str, req: Request):
+    # Basic secret check
+    if secret != WEBHOOK_SECRET:
+        return Response(status_code=403)
+
     update = await req.json()
     chat_id, message_id, text = extract_text(update)
     if not chat_id or not text:
@@ -133,8 +171,20 @@ async def telegram_webhook(req: Request):
 
     text = text.strip()
 
-    # --- Single check ---
-    # Accept: //chk <pipe>  OR /chk <pipe>
+    # Help
+    if text in ("/start", "/help"):
+        await tg_send_message(
+            chat_id,
+            "Commands:\n"
+            "//chk card|mm|yyyy|cvv  → format + Luhn\n"
+            "/mass then paste 1–30 lines of card|mm|yyyy|cvv\n\n"
+            "Example:\n"
+            "//chk 5220940191435288|06|2027|404",
+            reply_to=message_id,
+        )
+        return Response(status_code=200)
+
+    # Single check
     if text.startswith("//chk") or text.startswith("/chk"):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
@@ -149,17 +199,12 @@ async def telegram_webhook(req: Request):
 
         pan, mm, yy, cvv = parsed
         ok, issues = validate_card_fields(pan, mm, yy, cvv)
-        reply = render_reply(pan, mm, yy, cvv, ok, issues)
+        reply = render_reply(pan, mm, yy, ok, issues)
         await tg_send_message(chat_id, reply, reply_to=message_id)
         return Response(status_code=200)
 
-    # --- Mass check ---
-    # Format:
-    # /mass
-    # 4111111111111111|12|2027|123
-    # 5555....|...
+    # Mass check
     if text.startswith("/mass"):
-        # everything after first line are card lines
         lines = text.splitlines()
         card_lines = lines[1:] if len(lines) > 1 else []
         cards = parse_mass_lines(card_lines)
@@ -167,41 +212,22 @@ async def telegram_webhook(req: Request):
         if not cards:
             await tg_send_message(
                 chat_id,
-                "Usage:\n/mass\n5220940191435288|06|2027|404\n4111111111111111|12|2027|123\n(1 to 30 lines)",
+                "Usage:\n/mass\n"
+                "5220940191435288|06|2027|404\n"
+                "4111111111111111|12|2027|123\n"
+                "(1 to 30 lines)",
                 reply_to=message_id,
             )
             return Response(status_code=200)
 
         await tg_send_message(chat_id, f"Processing {len(cards)} entries (format/Luhn only)...", reply_to=message_id)
 
-        # Send one-by-one (Telegram rate limits exist; we pace slightly)
         for pan, mm, yy, cvv in cards:
             ok, issues = validate_card_fields(pan, mm, yy, cvv)
-            reply = render_reply(pan, mm, yy, cvv, ok, issues)
+            reply = render_reply(pan, mm, yy, ok, issues)
             await tg_send_message(chat_id, reply)
-            await asyncio.sleep(0.25)  # gentle pacing
+            await asyncio.sleep(0.25)  # pacing for Telegram rate limits
 
         return Response(status_code=200)
 
-    # Help
-    if text in ("/start", "/help"):
-        await tg_send_message(
-            chat_id,
-            "Commands:\n"
-            "//chk card|mm|yyyy|cvv  → format + Luhn\n"
-            "/mass (newline) card|mm|yyyy|cvv (1–30 lines)\n\n"
-            "Example:\n"
-            "//chk 5220940191435288|06|2027|404",
-            reply_to=message_id
-        )
-
     return Response(status_code=200)
-
-@app.on_event("startup")
-async def on_startup():
-    # Optionally auto-set webhook if PUBLIC_BASE_URL is provided.
-    if not (BOT_TOKEN and WEBHOOK_SECRET and PUBLIC_BASE_URL):
-        return
-    webhook_url = f"{PUBLIC_BASE_URL}/webhook/{WEBHOOK_SECRET}"
-    async with httpx.AsyncClient(timeout=20) as client:
-        await client.post(f"{TELEGRAM_API}/setWebhook", json={"url": webhook_url})
